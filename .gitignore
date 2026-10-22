@@ -1,0 +1,41 @@
+# ── 凭据（绝对禁止入库）──────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# ── 运行时产物 ────────────────────────────────────────
+runs/
+logs/
+*.log
+data/binance/*.json
+data/binance/*.jsonl
+data/news/*.jsonl
+backups/
+archive/
+runs/.quant_heavy.lock
+data/.code_hash
+data/news/.last_pull_date
+
+# ── 数据面板（体积大、可重新生成）──────────────────────
+# 但因子库是研究成果，必须入库：它记录了「哪些信号经过了 OOS 检验并晋级」，
+# 丢了就等于丢了整个挖掘历史。
+data/*
+!data/README.md
+!data/factor_library.json
+
+# ── Python ────────────────────────────────────────────
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# ── 编辑器 / 系统 ──────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+*.swp

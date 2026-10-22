@@ -1,0 +1,30 @@
+[Unit]
+Description=Quant Lab Continuous Factor Miner (anti-overfit, serial, OOM-safe)
+Documentation=file:/opt/quant-lab/PROGRESS.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/quant-lab
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=MINE_COOLDOWN_SEC=600
+# 无限循环挖因子：每轮 mine(美股+A股3指数+正交) -> 晋升闸门 -> 冷却。
+# 防过拟合：DSR 的试验数 N 随时间单调增长；只有跨多次独立会话反复出现且
+# 通过 DSR/PBO 的因子才进正式因子库(data/factor_library.json)。
+# 串行 + 内存守卫，绝不并发跑重任务。
+ExecStart=/opt/quant-lab/scripts/mine_loop.sh
+
+Restart=on-failure
+RestartSec=120
+
+StandardOutput=append:/opt/quant-lab/runs/mine_loop.log
+StandardError=append:/opt/quant-lab/runs/mine_loop.log
+
+# 与本机其它服务(量化交易/Y2A)共享 ~1.9GB 内存，务必限内存
+MemoryMax=1200M
+CPUQuota=70%
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

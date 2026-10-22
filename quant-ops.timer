@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Quant Lab Ops Watchdog every 30 minutes
+Documentation=file:/opt/quant-lab/OVERFIT_GUARD.md
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+AccuracySec=1min
+Unit=quant-ops.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,682 @@
+"""大规模因子挖掘流水线。
+
+流程：
+  1. 候选来源（四路）：
+     A) 系统扫描：全算子×参数
+     B) 经典复合因子：有文献支撑的交互
+     C) LLM 批量提案：高并发，几百个
+     D) LLM 复合因子提案：让 LLM 设计交互因子（可选）
+  2. 全部回测（向量化，快速）
+  3. 统一 BH-FDR 校正 + 样本外同向 + 稳健性
+  4. 幸存者写入因子库 + 报告
+
+用法：
+  python -m core.mine --llm-total 300 --concurrency 16
+"""
+from __future__ import annotations
+import json
+import time
+from datetime import datetime
+from pathlib import Path
+
+from core import config, data, backtest, zoo as zoo_mod
+from factors.engine import OPS
+from factors.sweep import generate_grid
+from factors.composite import CLASSIC_COMBOS
+
+
+def _spec_key(spec: dict) -> str:
+    if spec.get("kind") == "combo" or "expr" in spec:
+        payload = {"expr": spec.get("expr"), "direction": spec.get("direction", 1)}
+    else:
+        payload = {"op": spec.get("op"), "params": spec.get("params", {}),
+                   "direction": spec.get("direction", 1)}
+    return json.dumps(payload, sort_keys=True)
+
+
+def _perf_matrix(panel: dict, results: list[dict], hold: int = 1,
+                 max_configs: int = 120) -> np.ndarray | None:
+    """构造 PBO 用的「候选×期收益」矩阵（每列一个候选的多空期收益）。
+
+    PBO(CSCV) 需要对同一时间轴上、多个配置的期收益。这里取本次回测过的
+    候选里 IC 绝对值靠前的一批（限制数量以控计算量），对齐到同一日期索引。
+    """
+    import numpy as np
+    from factors.engine import factor_series_to_frame
+    from core.backtest import forward_returns
+    from core.backtest_fast import layered_ls_fast
+
+    ranked = sorted(results, key=lambda r: -abs(r.get("ic_mean", 0) or 0))
+    ranked = ranked[:max_configs]
+    cols = []
+    index = None
+    for r in ranked:
+        try:
+            f = factor_series_to_frame(panel, r["spec"])
+            fwd = forward_returns(panel, hold=hold)
+            gross, _, _, _ = layered_ls_fast(f, fwd)
+            if len(gross) < 40:
+                continue
+            if index is None:
+                index = gross.index
+                cols.append(gross)
+            else:
+                g = gross.reindex(index)
+                cols.append(g)
+        except Exception:
+            continue
+    if len(cols) < 2:
+        return None
+    import pandas as pd
+    mat = pd.concat(cols, axis=1)
+    return mat.to_numpy(dtype=float)
+
+
+def _valid(spec: dict) -> bool:
+    if spec.get("kind") == "combo" or "expr" in spec:
+        return True  # 复合因子由引擎校验
+    if spec.get("op") not in OPS:
+        return False
+    for k, v in (spec.get("params") or {}).items():
+        if not isinstance(v, int):
+            return False
+        if k == "n" and not (2 <= v <= 250):
+            return False
+        if k == "skip" and not (0 <= v <= 60):
+            return False
+    return True
+
+
+def mine(panel: dict, llm_total: int = 300, concurrency: int = 16,
+         do_sweep: bool = True, do_classic: bool = True,
+         llm_composite: int = 0, history: list[dict] | None = None,
+         train_frac: float = 0.7, hold: int = 1, neutralize_size: bool = True,
+         do_lowfreq: bool = False,
+         lowfreq_strict: bool = False,
+         orthogonal_only: bool = False, max_corr: float = 0.5,
+         market: str = "us",
+         use_cache: bool = True,
+         proposal_pool: list[dict] | None = None,
+         out_json: Path | None = None, verbose: bool = True) -> dict:
+    all_specs: list[dict] = []
+    seen: set[str] = set()
+    z = zoo_mod.load()
+
+    def add(specs: list[dict], tag: str):
+        fresh = []
+        for s in specs:
+            s = {**s, "source": tag}
+            if not _valid(s):
+                continue
+            k = _spec_key(s)
+            if k in seen:
+                continue
+            seen.add(k)
+            fresh.append(s)
+        all_specs.extend(fresh)
+        if verbose:
+            print(f"  [{tag}] 新增 {len(fresh)} 个候选", flush=True)
+
+    # A) 系统扫描
+    if do_sweep:
+        if verbose: print("\n[A] 系统扫描全算子空间...", flush=True)
+        add(generate_grid(), "sweep")
+
+    # B) 经典复合因子
+    if do_classic:
+        if verbose: print("\n[B] 经典复合因子...", flush=True)
+        combos = []
+        for c in CLASSIC_COMBOS:
+            for direction in (1, -1):
+                combos.append({
+                    "name": f"{c['name']}_d{direction}", "kind": "combo",
+                    "expr": {"op": c["op"], "left": c["left"], "right": c["right"]},
+                    "direction": direction, "rationale": c["rationale"],
+                })
+        add(combos, "classic_combo")
+
+    # C) LLM 批量提案（单算子）
+    # 优先用共享池：一个 round 只调用一次 LLM，各标的从同一池里取用。
+    # 池为空（LLM 不可用）时才回退到本进程自行提案，保证挖掘不中断。
+    if proposal_pool:
+        if verbose:
+            print(f"\n[C] 使用共享提案池（{len(proposal_pool)} 个候选，本 round 共用）...",
+                  flush=True)
+        add(proposal_pool, "llm_batch")
+    elif llm_total > 0:
+        if verbose: print(f"\n[C] LLM 批量提案（目标 {llm_total}）...", flush=True)
+        try:
+            from llm.proposer_batch import propose_batch
+            llm_specs = propose_batch(total=llm_total, concurrency=concurrency,
+                                      per_call=6, tried=all_specs)
+            add(llm_specs, "llm_batch")
+        except Exception as e:
+            if verbose: print(f"  [C] LLM 提案失败: {e}", flush=True)
+
+    # D) LLM 复合因子提案（交互因子 —— LLM 相对网格扫描的独有增量）
+    if llm_composite > 0:
+        if verbose: print(f"\n[D] LLM 复合因子提案（目标 {llm_composite}）...", flush=True)
+        try:
+            from llm.proposer_composite import propose_composite_batch
+            comp = propose_composite_batch(
+                total=llm_composite, concurrency=concurrency, per_call=5,
+                tried=all_specs, history=history)
+            add(comp, "llm_composite")
+        except Exception as e:
+            if verbose: print(f"  [D] 复合提案失败: {e}", flush=True)
+
+    # 可选：正交筛选（只保留与趋势簇低相关的候选）
+    if orthogonal_only:
+        from core.orthogonal import select_orthogonal, cluster_for
+        cluster = cluster_for(market)
+        if verbose: print(f"\n[正交筛选] 排除与主导簇高相关的候选（market={market}）...", flush=True)
+        all_specs = select_orthogonal(panel, all_specs, cluster,
+                                      max_corr=max_corr, verbose=verbose)
+
+    total = len(all_specs)
+    if verbose:
+        print(f"\n===== 开始回测 {total} 个候选 ===== ", flush=True)
+    t0 = time.time()
+    results = []
+    # 缓存复用：本机仅 2 核 + ~1.9GB 内存，串行回测 ~0.2/s，全量重跑太慢。
+    # 若某 spec 在 zoo 里已有【同数据窗口(panel_end相同)】的结果，直接复用，
+    # 不再重算。这不影响防过拟合：可重复性由 promote 的「跨会话」判定负责，
+    # 而这里只是避免对同一窗口做冗余计算。用 --no-cache 可强制全量重算。
+    panel_end = None
+    try:
+        panel_end = str(panel["c"].index[-1].date())
+    except Exception:
+        pass
+    reused = 0
+    if use_cache:
+        for s in all_specs:
+            k = zoo_mod._key(s, hold)
+            prev = z["factors"].get(k)
+            if not prev:
+                continue
+            try:
+                ok = (prev.get("panel_end") == panel_end
+                      and prev.get("hold") == hold
+                      and isinstance(prev.get("result"), dict))
+            except Exception:
+                ok = False
+            if ok:
+                r0 = dict(prev["result"])
+                if "spec" not in r0:
+                    r0["spec"] = s
+                results.append(r0)
+                reused += 1
+        if reused and verbose:
+            print(f"  [缓存] 复用 {reused} 个同窗口结果，仅回测其余 "
+                  f"{total - reused} 个", flush=True)
+    _done_keys = {zoo_mod._key(r.get("spec", {}), hold) for r in results}
+    for i, s in enumerate(all_specs):
+        if use_cache and zoo_mod._key(s, hold) in _done_keys:
+            continue
+        try:
+            res = backtest.evaluate_with_split(
+                panel, s.get("name", s.get("op", "f")), s, hold=hold,
+                train_frac=train_frac, neutralize_size=neutralize_size)
+        except Exception:
+            continue
+        rec = {
+            "name": res.name, "op": s.get("op"),
+            "params": s.get("params", {}), "direction": s.get("direction", 1),
+            "rationale": s.get("rationale", ""), "source": s.get("source", ""),
+            "spec": s,
+            "ic_mean": res.ic_mean, "icir": res.icir, "ic_tstat": res.ic_tstat,
+            "ls_sharpe": res.ls_sharpe, "net_ls_sharpe": res.net_ls_sharpe,
+            "ls_return": res.ls_return, "turnover": res.turnover,
+            "n_days": res.n_days, "p_value": res.p_value,
+            "oos_ic_mean": res.oos_ic_mean, "oos_ls_sharpe": res.oos_ls_sharpe,
+        }
+        results.append(rec)
+        zoo_mod.record(z, s, rec, panel_end=panel_end, hold=hold)
+        if verbose and (i + 1) % 100 == 0:
+            dt = time.time() - t0
+            print(f"  进度 {i+1}/{total} ({dt:.0f}s, {(i+1)/dt:.1f}/s)", flush=True)
+
+    # --- 多重检验校正 ---
+    # 注意：BH-FDR 的 n 必须是独立假设数。这里每个 spec 都会回测 +1/-1
+    # 两个方向（方向属于 spec，但统计上是同一个假设——|IC| 显著性完全相同，
+    # 实测 p 值成对一模一样）。直接拿记录数做 BH 会让阈值 q*rank/n 被稀释
+    # 一半，把真实信号埋掉。先按 (op, params) 归并取最强 p，再回填。
+    #
+    # 附带记录一个**被否掉的优化**（2026-10-17 实测，勿再尝试）：
+    # 曾想「反向方向直接翻转镜像结果，省一半回测」，验证后发现只有
+    # ic_mean / ic_tstat / p_value 严格取反（170/170 验证通过），
+    # 但 ls_sharpe 只有 34/170 取反、turnover 只有 25/170 相同 ——
+    # 多空组合同样受 beta/分层不对称影响（如 news_attention_n3 偏差达 0.6）。
+    # 而幸存判定恰恰以 ls_sharpe 为准，复用镜像会静默污染入库决策，故放弃。
+    # 注意：命名不能叫 _spec_key —— 模块级已有同名函数，函数内重新定义会把
+    # 该名字变成局部变量，导致本函数前半段（第 110 行附近）调用时报
+    # NameError: cannot access free variable。用 _hyp_key 避免遮蔽。
+    def _hyp_key(r: dict) -> str:
+        return f"{r.get('op')}|{json.dumps(r.get('params') or {}, sort_keys=True)}"
+
+    groups: dict[str, list[int]] = {}
+    for i, r in enumerate(results):
+        groups.setdefault(_hyp_key(r), []).append(i)
+    keys = list(groups)
+    group_p = [min(results[i]["p_value"] for i in groups[k]) for k in keys]
+    if verbose:
+        print(f"\n===== BH-FDR 校正（{len(results)} 条记录 → "
+              f"{len(keys)} 个独立假设）=====", flush=True)
+    passed_groups = backtest.benjamini_hochberg(group_p, q=0.10)
+    passed_group_set = {k for k, ok in zip(keys, passed_groups) if ok}
+    for r in results:
+        ok = _hyp_key(r) in passed_group_set
+        # 关键：A股/美股都存在"强市场beta + 因子分层单调"，导致横截面 rank IC
+        # 与多空组合收益系统性异号。用 IC 符号筛会选中"IC正但LS收益负"的假幸存。
+        # 因此幸存判定改以【多空组合收益(已对冲beta)】为准：
+        #   - 样本内 LS Sharpe 与 OOS LS Sharpe 同号且都为正，或都为负(镜像，去重时取正)
+        #   - OOS IC 与 IC 同号(保留，作为一致性副证，但不作为唯一依据)
+        #   - OOS LS Sharpe 幅度足够大
+        is_sh = r.get("ls_sharpe", float("nan"))
+        oos_sh = r.get("oos_ls_sharpe", float("nan"))
+        net_sh = r.get("net_ls_sharpe", float("nan"))
+        oos_ok = False
+        if oos_sh == oos_sh and is_sh == is_sh:
+            same_sign = (is_sh > 0) == (oos_sh > 0)
+            strong = abs(oos_sh) >= 0.3
+            # 净 Sharpe(扣成本)方向不能与 OOS 相反(避免成本把收益吃反)
+            net_ok = (net_sh != net_sh) or (abs(net_sh) < 1e-9) or ((net_sh > 0) == (oos_sh > 0))
+            oos_ok = bool(same_sign and strong and net_ok)
+        # OOS IC 一致性作为副证记录
+        ic_consist = False
+        if r["oos_ic_mean"] == r["oos_ic_mean"] and r["ic_mean"] != 0:
+            ic_consist = ((r["ic_mean"] > 0) == (r["oos_ic_mean"] > 0))
+        r["fdr_pass"] = bool(ok)
+        r["oos_confirmed"] = bool(oos_ok)
+        r["ic_consistent"] = bool(ic_consist)
+        r["survivor"] = bool(ok and oos_ok)
+
+    survivors = [r for r in results if r["survivor"]]
+    # 去重（同 op+params 正反方向留 LS Sharpe 更正的那份）
+    dedup = {}
+    for r in survivors:
+        k = json.dumps({"op": r["op"], "params": r.get("params", {})}, sort_keys=True)
+        key_val = (r.get("oos_ls_sharpe", 0) or 0) + (r.get("ls_sharpe", 0) or 0)
+        if k not in dedup:
+            dedup[k] = r
+        else:
+            prev = (dedup[k].get("oos_ls_sharpe", 0) or 0) + (dedup[k].get("ls_sharpe", 0) or 0)
+            if key_val > prev:
+                dedup[k] = r
+    survivors = sorted(dedup.values(), key=lambda x: -(x.get("oos_ls_sharpe", 0) or 0))
+
+    # --- 方向归一化：稳定的负向信号应自动翻转，使所有幸存者都是"正向可交易" ---
+    # 判定"稳定负向"：样本内 + OOS 的 LS Sharpe 都为负（同号），
+    # 且净 Sharpe 亦为负，说明翻转后应转正。翻转后重算一遍以得到正确数字。
+    flipped = 0
+    for r in survivors:
+        is_sh = r.get("ls_sharpe", float("nan"))
+        oos_sh = r.get("oos_ls_sharpe", float("nan"))
+        net_sh = r.get("net_ls_sharpe", float("nan"))
+        if (is_sh == is_sh and oos_sh == oos_sh and is_sh < 0 and oos_sh < 0
+                and (net_sh != net_sh or net_sh < 0)):
+            spec2 = dict(r["spec"])
+            spec2["direction"] = -spec2.get("direction", 1)
+            # 名字标记方向已翻
+            base = r["name"].rsplit("_d", 1)[0] if "_d" in r["name"] else r["name"]
+            spec2["name"] = f"{base}_flip"
+            try:
+                res2 = backtest.evaluate_with_split(
+                    panel, spec2["name"], spec2,
+                    hold=hold, train_frac=train_frac, neutralize_size=neutralize_size)
+                r["spec"] = spec2
+                r["name"] = spec2["name"]
+                r["direction_flipped"] = True
+                r["ic_mean"] = res2.ic_mean
+                r["icir"] = res2.icir
+                r["ic_tstat"] = res2.ic_tstat
+                r["ls_sharpe"] = res2.ls_sharpe
+                r["net_ls_sharpe"] = res2.net_ls_sharpe
+                r["ls_return"] = res2.ls_return
+                r["turnover"] = res2.turnover
+                r["p_value"] = res2.p_value
+                r["oos_ic_mean"] = res2.oos_ic_mean
+                r["oos_ls_sharpe"] = res2.oos_ls_sharpe
+                flipped += 1
+            except Exception:
+                pass
+    survivors = sorted(survivors, key=lambda x: -(x.get("oos_ls_sharpe", 0) or 0))
+
+    # --- 可交易性复检：翻转后净 Sharpe(扣成本)仍显著为负的，剔除 ---
+    tradeable = []
+    dropped_notrade = 0
+    for r in survivors:
+        net_sh = r.get("net_ls_sharpe", float("nan"))
+        r["tradeable"] = bool(net_sh == net_sh and net_sh > -0.1)
+        if r["tradeable"]:
+            tradeable.append(r)
+        else:
+            dropped_notrade += 1
+    if verbose and dropped_notrade:
+        print(f"\n[可交易性复检] 剔除 {dropped_notrade} 个扣成本后净Sharpe仍为负的假幸存",
+              flush=True)
+    survivors = tradeable
+
+    # 稳健性检验
+    if survivors:
+        from core.robustness import robustness_report
+        if verbose: print(f"\n===== 稳健性检验（{len(survivors)} 个幸存）=====", flush=True)
+        for r in survivors:
+            try:
+                rb = robustness_report(panel, r["spec"])
+                r["robustness"] = rb
+                yrs = rb["yearly_ic"]
+                same = sum(1 for v in yrs.values() if (v["ic"] > 0) == (r["ic_mean"] > 0))
+                r["years_same_sign"] = f"{same}/{len(yrs)}"
+                # 与幸存判定同口径：分年 LS Sharpe 同向比例（应以这个为准）
+                yls = rb.get("yearly_ls_sharpe", {})
+                if yls and r["ls_sharpe"] != 0:
+                    sgn = 1 if r["ls_sharpe"] > 0 else -1
+                    same_ls = sum(1 for v in yls.values()
+                                  if (v["sharpe"] > 0) == (sgn > 0))
+                    r["years_same_sign_ls"] = f"{same_ls}/{len(yls)}"
+                if verbose:
+                    print(f"  ★ {r['name']:26s} OOS_Sh={r['oos_ls_sharpe']:+.2f} "
+                          f"分年IC={r['years_same_sign']} "
+                          f"分年LS={r.get('years_same_sign_ls','-')} "
+                          f"净Sh={r['net_ls_sharpe']:+.2f}", flush=True)
+            except Exception as e:
+                r["robustness"] = {"error": str(e)}
+
+    # --- 可选：对幸存因子跑降频检查（真实调仓法），把"日频 Sharpe"升级为"最优持有期净值" ---
+    if do_lowfreq and survivors and market == "ashare":
+        from core.ashare_backtest import (ls_nav_true_rebalance, vol_target_scale,
+                                          nav_stats)
+        # 成本口径与主流水线统一为 30bps；并做成本敏感性检验（20/30/40bps）。
+        COST_BASE = 30.0
+        COST_LOW, COST_HIGH = 20.0, 40.0
+        if verbose:
+            print(f"\n===== 降频检查（真实调仓法，{len(survivors)} 个幸存，"
+                  f"成本口径 {COST_BASE:.0f}bps + 敏感性 {COST_LOW:.0f}/{COST_HIGH:.0f}）=====",
+                  flush=True)
+        for r in survivors:
+            best = None
+            row = {}
+            for h in (5, 20, 40):
+                try:
+                    nav = ls_nav_true_rebalance(panel, r["spec"], hold=h, cost_bps=COST_BASE)
+                    row[h] = {"sharpe": round(nav["sharpe"], 3),
+                              "ann": round(nav["ann_ret"], 4),
+                              "max_dd": round(nav["max_dd"], 4)}
+                    if best is None or nav["sharpe"] > best[1]["sharpe"]:
+                        best = (h, row[h])
+                except Exception:
+                    row[h] = None
+            r["lowfreq"] = {"grid": row, "best_hold": best[0] if best else None,
+                            "best_sharpe": best[1]["sharpe"] if best else None,
+                            "best_ann": best[1]["ann"] if best else None,
+                            "cost_bps": COST_BASE}
+            # 成本敏感性：在最优持有期上，分别用低成本/高成本再算
+            cost_ok = False
+            if best is not None:
+                try:
+                    nav_lo = ls_nav_true_rebalance(panel, r["spec"], hold=best[0], cost_bps=COST_LOW)
+                    nav_hi = ls_nav_true_rebalance(panel, r["spec"], hold=best[0], cost_bps=COST_HIGH)
+                    r["lowfreq"]["cost_sensitivity"] = {
+                        "sharpe_at_20bps": round(nav_lo["sharpe"], 3),
+                        "sharpe_at_40bps": round(nav_hi["sharpe"], 3),
+                    }
+                    # 成本稳健：基准成本为正 且 高成本下仍 > 0
+                    cost_ok = bool(nav_hi["sharpe"] > 0.0)
+                except Exception:
+                    r["lowfreq"]["cost_sensitivity"] = None
+            # 波动率目标化版本（降低回撤）：对最优持有期再做一次
+            if best is not None:
+                try:
+                    nav = ls_nav_true_rebalance(panel, r["spec"], hold=best[0], cost_bps=COST_BASE)
+                    vt = vol_target_scale(nav["period_returns"],
+                                          periods_per_year=nav["periods_per_year"],
+                                          target_ann=0.10)
+                    st = nav_stats(vt, periods_per_year=nav["periods_per_year"])
+                    r["lowfreq"]["vol_target"] = {
+                        "target_ann": 0.10, "ann": round(st["ann"], 4),
+                        "sharpe": round(st["sharpe"], 3),
+                        "max_dd": round(st["max_dd"], 4)}
+                except Exception:
+                    r["lowfreq"]["vol_target"] = None
+            # 分段稳健性：全期漂亮但某段崩的因子要暴露出来
+            seg_ok = True
+            if best is not None:
+                try:
+                    from core.robustness import subperiod_sharpe
+                    nav = ls_nav_true_rebalance(panel, r["spec"], hold=best[0], cost_bps=COST_BASE)
+                    segs = subperiod_sharpe(nav["period_returns"], nav["periods_per_year"], n_splits=5)
+                    r["lowfreq"]["subperiods"] = [
+                        {"seg": s["seg"], "sharpe": round(s["sharpe"], 2),
+                         "ann": round(s["ann"], 4), "hit": round(s["hit"], 2)} for s in segs]
+                    neg = [s for s in segs if s["sharpe"] < 0]
+                    r["lowfreq"]["n_negative_segments"] = len(neg)
+                    # 分段稳健：至多 1 段为负（容忍单段低谷）
+                    seg_ok = len(neg) <= 1
+                except Exception:
+                    r["lowfreq"]["subperiods"] = None
+            r["lowfreq_segment_robust"] = seg_ok
+            # 标记：真实调仓下 30bps 净 Sharpe 达标 且 40bps 仍为正（成本稳健）
+            r["lowfreq_cost_robust"] = cost_ok
+            r["lowfreq_tradeable"] = bool(best and best[1]["sharpe"] > 0.2 and cost_ok and seg_ok)
+            if verbose and best:
+                flag = "" if r["lowfreq_tradeable"] else (
+                    "  ⚠️降频成本敏感" if not cost_ok else "  ⚠️降频仍无效")
+                cs = r["lowfreq"].get("cost_sensitivity") or {}
+                cstxt = (f" 成本敏感[40bps Sh={cs['sharpe_at_40bps']:+.2f}]"
+                         if cs and not cost_ok else "")
+                vt = r["lowfreq"].get("vol_target")
+                vtxt = (f" | 波动目标化 Sh={vt['sharpe']:+.2f} 回撤={vt['max_dd']:+.1%}"
+                        if vt else "")
+                print(f"  {r['name']:26s} 最优h={best[0]:2d} "
+                      f"真实净Sh={best[1]['sharpe']:+.2f} 年化={best[1]['ann']:+.1%} "
+                      f"回撤={best[1]['max_dd']:+.1%}{vtxt}{cstxt}{flag}", flush=True)
+
+        # 严格模式：只保留真实调仓下降频后仍可交易的因子
+        if lowfreq_strict:
+            kept = [r for r in survivors if r.get("lowfreq_tradeable")]
+            dropped = len(survivors) - len(kept)
+            if verbose and dropped:
+                print(f"\n[降频严格模式] 从 {len(survivors)} 个幸存中剔除 {dropped} 个"
+                      f"真实调仓下不可交易的，保留 {len(kept)} 个", flush=True)
+            survivors = kept
+            # 按真实净 Sharpe 排序
+            survivors = sorted(survivors,
+                               key=lambda x: -(x.get("lowfreq", {}).get("best_sharpe") or 0))
+
+    # --- 防过拟合元层（持续挖矿必需）---
+    #   单次 BH-FDR + OOS 只解决「这一次」的多重检验；但【持续】挖掘会反复
+    #   对同一段 OOS 做选择，使其逐渐失效。这里补两道业界护栏：
+    #     ① DSR：按累计试验数 N 给幸存因子 Sharpe 打折
+    #     ② PBO(CSCV)：从全部候选中估计回测过拟合概率
+    #   并把本次试验登记入册，累计 N 供 DSR 使用。
+    if survivors:
+        from core import overfit_guard as og
+        cum = og.cumulative_trials()
+        # 用「本次候选数」作为这一批的试验规模；累计用于更保守的场景
+        n_trials_this = max(len(results), 1)
+        if verbose:
+            print(f"\n===== 防过拟合元层（DSR + PBO，本次试验数 {n_trials_this}，"
+                  f"累计 {cum}）=====", flush=True)
+        for r in survivors:
+            try:
+                # 用该因子的多空净收益序列估计 DSR（用日频期收益）
+                from factors.engine import factor_series_to_frame
+                from core.backtest import forward_returns
+                from core.backtest_fast import layered_ls_fast
+                # 2026-10-20 修复：DSR 的 N 必须与**晋升闸门**用同一个口径，
+                # 否则会出现「巡查里 DSR=1.0 ✅，晋升却说 DSR 不够」的自相矛盾。
+                # 闸门用的是累计试验数（同族网格变体按有效试验折算，见
+                # core.promote.effective_trials），这里保持一致。
+                try:
+                    from core.promote import effective_trials
+                    n_for_dsr, _ = effective_trials({r.get("name", ""): r}, cum)
+                except Exception:  # noqa: BLE001
+                    n_for_dsr = cum
+                f = factor_series_to_frame(panel, r["spec"])
+                fwd = forward_returns(panel, hold=hold)
+                gross, _, _, _ = layered_ls_fast(f, fwd)
+                dsr = og.deflated_sharpe(gross.to_numpy(), n_trials=n_for_dsr)
+                r["dsr"] = dsr
+            except Exception as e:  # noqa: BLE001
+                r["dsr"] = {"error": str(e)}
+        # PBO：构造候选×期收益矩阵（每列一个候选的 LS 期收益）
+        try:
+            perf = _perf_matrix(panel, results, hold=hold)
+            pbo = og.pbo_cscv(perf, n_splits=8) if perf is not None else {"pbo": None}
+            for r in survivors:
+                r["pbo_cscv"] = pbo
+            if verbose and pbo.get("pbo") is not None:
+                print(f"  PBO(CSCV, {pbo['n_configs']} 候选 × {pbo['n_splits']} 块) "
+                      f"= {pbo['pbo']:.2f}"
+                      + ("  ⚠️ 过拟合风险高" if pbo["pbo"] > 0.5 else "  ✅ 可接受"),
+                      flush=True)
+            for r in survivors:
+                d = r.get("dsr", {})
+                if isinstance(d, dict) and "dsr" in d and verbose:
+                    print(f"  ★ {r['name']:24s} DSR={d['dsr']:.3f} "
+                          f"(N={d['n_trials']})"
+                          + ("  ✅" if d.get("dsr", 0) >= 0.95 else "  ⚠️ 打折后不显著"),
+                          flush=True)
+        except Exception as e:  # noqa: BLE001
+            if verbose:
+                print(f"  [PBO] 计算失败: {e}", flush=True)
+
+    # 登记本次会话，累计试验数
+    try:
+        from core import overfit_guard as og
+        og.record_session(n_candidates=len(results), n_survivors=len(survivors),
+                          market=market, note="core.mine run")
+    except Exception:
+        pass
+
+    # 数据窗口指纹（2026-10 加入）。
+    # 为什么需要：晋升闸门用 n_sessions 做「跨会话可重复性」判据，但原先
+    # mine 结果不记录用的是哪段数据。实测 mom_n250_skip20 出现 46 次、
+    # 来自 32 个文件，可 OOS 只有 5 种值（0.4674 重复 35 次）—— 因为多次
+    # 挖掘用的是同一段历史，回测结果自然一模一样。没有窗口指纹就无法区分
+    # 「32 次独立验证」和「同一结果抄了 32 遍」，可重复性检查形同虚设。
+    # 这里记录起止日期 + 交易日数 + 标的数，供下游去重。
+    _win = {}
+    try:
+        _idx = panel["c"].index
+        _dates = sorted({str(d)[:10] for d in _idx})
+        _win = {
+            "data_start": _dates[0] if _dates else None,
+            "data_end": _dates[-1] if _dates else None,
+            "n_dates": len(_dates),
+            "n_symbols": int(panel["c"].shape[1]),
+        }
+    except Exception:
+        pass
+
+    out = {
+        "generated_at": datetime.now().isoformat(),
+        # 窗口指纹：同一段数据跑多次，这些字段必然相同
+        "data_window": _win,
+        "data_window_id": (f"{_win.get('data_start')}..{_win.get('data_end')}"
+                           f"|{_win.get('n_dates')}d|{_win.get('n_symbols')}s"
+                           if _win else None),
+        "n_candidates": total, "n_backtested": len(results),
+        "n_fdr_pass": int(sum(r["fdr_pass"] for r in results)),
+        "n_survivors": len(survivors),
+        "by_source": {s: sum(1 for r in results if r["source"] == s)
+                      for s in {r["source"] for r in results}},
+        "elapsed_sec": round(time.time() - t0, 1),
+        "train_frac": train_frac, "hold": hold,
+        # 本轮有多少结果是从 zoo 缓存直接复用的（没有真正重算）。
+        # 关键：复用的结果和上一轮**完全一样**，不能算作一次独立验证。
+        # promote 的「跨会话可重复性」必须把这类会话排除，否则
+        # 「同一结果被复用 N 次」会被误当成「独立复现 N 次」。
+        "n_reused_from_cache": reused,
+        "n_actually_backtested": max(0, total - reused),
+        "all_results": sorted(results, key=lambda x: -abs(x["ic_mean"])),
+        "survivors": survivors,
+    }
+    zoo_mod.save(z)
+
+    if out_json:
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+
+        def _default(o):
+            # numpy 标量/数组 → Python 原生，避免序列化崩溃
+            import numpy as _np
+            if isinstance(o, (_np.integer,)):
+                return int(o)
+            if isinstance(o, (_np.floating,)):
+                return float(o)
+            if isinstance(o, (_np.bool_,)):
+                return bool(o)
+            if isinstance(o, _np.ndarray):
+                return o.tolist()
+            raise TypeError(f"不可序列化: {type(o)}")
+
+        out_json.write_text(json.dumps(out, ensure_ascii=False, indent=2,
+                                       default=_default))
+    if verbose:
+        print(f"\n幸存 {len(survivors)} 个 | 候选 {total} | 耗时 {out['elapsed_sec']}s", flush=True)
+    return out
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--llm-total", type=int, default=300)
+    ap.add_argument("--llm-composite", type=int, default=0,
+                    help="LLM 复合因子（交互因子）提案数量，0=关闭")
+    ap.add_argument("--concurrency", type=int, default=16)
+    ap.add_argument("--no-sweep", action="store_true")
+    ap.add_argument("--market", default="us", choices=["us", "ashare"],
+                    help="数据市场：us=美股 / ashare=A股")
+    ap.add_argument("--index", default="000300",
+                    help="A股指数：000300=沪深300 / 000905=中证500 / 000852=中证1000")
+    ap.add_argument("--orthogonal", action="store_true",
+                    help="只保留与趋势簇低相关的候选（找正交新因子）")
+    ap.add_argument("--max-corr", type=float, default=0.5)
+    ap.add_argument("--lowfreq", action="store_true",
+                    help="对幸存因子跑降频检查（真实调仓法，仅A股）")
+    ap.add_argument("--lowfreq-strict", action="store_true",
+                    help="只保留真实调仓下降频后仍可交易的因子（隐含 --lowfreq）")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="禁用 zoo 缓存复用，强制全量重算（默认启用缓存）")
+    ap.add_argument("--proposal-pool", default=None,
+                    help="共享提案池 JSON 路径（runs/loop_*/round_*/proposal_pool.json）。"
+                         "指定后本进程不再单独调用 LLM，改用池中的全局候选，"
+                         "使一个 round 只花一次 LLM 成本。")
+    ap.add_argument("--hold", type=int, default=1,
+                    help="持有期（交易日）。默认 1 = 次日收盘换仓。"
+                         "FDR/DSR 的 IC 与回测都基于该持有期；"
+                         "换一个 hold 等于换一个搜索空间维度，"
+                         "历史结果按 (spec, hold) 分别缓存，互不干扰。")
+    ap.add_argument("--out", default=None)
+    args = ap.parse_args()
+
+    # 共享池：存在则读取；池里为空（LLM 失败）则回退到进程内提案
+    # 注意：直接读 args.proposal_pool 指向的文件，不要用 .parent 再拼路径——
+    # 池文件名带 hold 后缀（proposal_pool_h5.json），按 parent+默认 hold 拼会
+    # 找不到文件而静默回退到进程内提案，使 hold 维度的池隔离形同失效。
+    pool_specs = None
+    if args.proposal_pool:
+        from core.proposal_pool import load_pool_file
+        try:
+            pool_specs = load_pool_file(args.proposal_pool)
+        except Exception:
+            pool_specs = None
+        if not pool_specs:
+            print(f"  [提案池] {args.proposal_pool} 不可用或为空，回退到进程内 LLM 提案",
+                  flush=True)
+
+    p = data.build_panel(market=args.market, index=args.index)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    mkt = "" if args.market == "us" else f"_{args.market}"
+    idx_tag = "" if args.market == "us" or args.index == "000300" else f"{args.index}"
+    outp = Path(args.out) if args.out else config.RUNS_DIR / f"mine{mkt}{idx_tag}_{ts}.json"
+    run = mine(p, llm_total=args.llm_total, concurrency=args.concurrency,
+               do_sweep=not args.no_sweep, orthogonal_only=args.orthogonal,
+               max_corr=args.max_corr, market=args.market, out_json=outp,
+               llm_composite=args.llm_composite,
+               proposal_pool=pool_specs,
+               hold=args.hold,
+               do_lowfreq=(args.lowfreq or args.lowfreq_strict),
+               lowfreq_strict=args.lowfreq_strict,
+               use_cache=not args.no_cache)

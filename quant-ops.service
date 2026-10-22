@@ -1,0 +1,11 @@
+[Unit]
+Description=Quant Lab Ops Watchdog (self-heal + audit, every 30 min)
+Documentation=file:/opt/quant-lab/OVERFIT_GUARD.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/quant-lab
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/quant-lab/scripts/ops_cron.sh
+StandardOutput=append:/opt/quant-lab/runs/ops_watch.log
+StandardError=append:/opt/quant-lab/runs/ops_watch.log

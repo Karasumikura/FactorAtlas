@@ -1,0 +1,339 @@
+{
+  "factors": {
+    "{\"direction\": 1, \"op\": \"volatility_ratio\", \"params\": {\"n\": 15}}": {
+      "name": "intraday_amplitude_risk_flip",
+      "spec": {
+        "name": "intraday_amplitude_risk_flip",
+        "op": "volatility_ratio",
+        "params": {
+          "n": 15
+        },
+        "direction": 1,
+        "rationale": "日内振幅均值高代表信息不对称与流动性提供者风险溢价高，微观结构噪音大的股票未来收益被折价。",
+        "source": "llm_batch"
+      },
+      "n_sessions": 3,
+      "oos_median": 0.7328,
+      "dsr_best": 0.9828,
+      "pbo_best": 0.3286,
+      "lf_net_median": 0.55,
+      "first_promoted": "2026-10-16T22:49:29.544421+00:00",
+      "last_seen": "2026-10-17T03:55:48.545260+00:00"
+    },
+    "{\"direction\": 1, \"op\": \"mom\", \"params\": {\"n\": 250, \"skip\": 20}}": {
+      "name": "mom_n250_skip20",
+      "spec": {
+        "name": "mom_n250_skip20",
+        "op": "mom",
+        "params": {
+          "n": 250,
+          "skip": 20
+        },
+        "direction": 1,
+        "rationale": "系统扫描 mom{'n': 250, 'skip': 20} dir=1",
+        "source": "sweep"
+      },
+      "n_sessions": 24,
+      "oos_median": 0.4674,
+      "dsr_best": 0.9512,
+      "pbo_best": 0.1429,
+      "lf_net_median": 0.213,
+      "first_promoted": "2026-10-16T15:27:52.161390+00:00",
+      "last_seen": "2026-10-17T03:55:48.545381+00:00"
+    },
+    "{\"direction\": 1, \"expr\": {\"left\": {\"op\": \"trend_strength\", \"params\": {\"n\": 120}}, \"op\": \"div\", \"right\": {\"op\": \"vol\", \"params\": {\"n\": 60}}}}": {
+      "name": "trend_x_lowvol_d1",
+      "spec": {
+        "name": "trend_x_lowvol_d1",
+        "kind": "combo",
+        "expr": {
+          "op": "div",
+          "left": {
+            "op": "trend_strength",
+            "params": {
+              "n": 120
+            }
+          },
+          "right": {
+            "op": "vol",
+            "params": {
+              "n": 60
+            }
+          }
+        },
+        "direction": 1,
+        "rationale": "趋势强度除以波动，稳健趋势",
+        "source": "classic_combo"
+      },
+      "n_sessions": 23,
+      "oos_median": 0.3588,
+      "dsr_best": 0.973,
+      "pbo_best": 0.1429,
+      "lf_net_median": 0.365,
+      "first_promoted": "2026-10-16T15:27:52.161422+00:00",
+      "last_seen": "2026-10-17T03:55:48.545392+00:00"
+    },
+    "{\"direction\": 1, \"op\": \"skew\", \"params\": {\"n\": 33}}": {
+      "name": "skew_tail_risk_33_flip",
+      "spec": {
+        "name": "skew_tail_risk_33_flip",
+        "op": "skew",
+        "params": {
+          "n": 33
+        },
+        "direction": 1,
+        "rationale": "正偏度高的股票多为彩票型标的，尾部风险溢价为负，20日持有下负偏度（稳健）股票风险调整收益更佳。",
+        "source": "llm_batch"
+      },
+      "n_sessions": 2,
+      "oos_median": 6.7716,
+      "dsr_best": 1.0,
+      "pbo_best": 0.0,
+      "lf_net_median": null,
+      "first_promoted": "2026-10-18T21:29:09.133044+00:00",
+      "last_seen": "2026-10-18T21:29:09.134044+00:00"
+    },
+    "{\"direction\": 1, \"op\": \"turnover_chg\", \"params\": {\"n\": 120}}": {
+      "name": "turnover_chg_n120",
+      "spec": {
+        "name": "turnover_chg_n120",
+        "op": "turnover_chg",
+        "params": {
+          "n": 120
+        },
+        "direction": 1,
+        "rationale": "系统扫描 turnover_chg{'n': 120} dir=1",
+        "source": "sweep"
+      },
+      "n_sessions": 2,
+      "oos_median": 5.0539,
+      "dsr_best": 1.0,
+      "pbo_best": 0.0,
+      "lf_net_median": null,
+      "first_promoted": "2026-10-18T21:29:09.135590+00:00",
+      "last_seen": "2026-10-18T21:29:09.135599+00:00"
+    },
+    "{\"direction\": 1, \"op\": \"volume_price_corr\", \"params\": {\"n\": 60}}": {
+      "name": "volume_price_corr_n60",
+      "spec": {
+        "name": "volume_price_corr_n60",
+        "op": "volume_price_corr",
+        "params": {
+          "n": 60
+        },
+        "direction": 1,
+        "rationale": "系统扫描 volume_price_corr{'n': 60} dir=1",
+        "source": "sweep"
+      },
+      "n_sessions": 2,
+      "oos_median": 4.3789,
+      "dsr_best": 1.0,
+      "pbo_best": 0.0,
+      "lf_net_median": null,
+      "first_promoted": "2026-10-18T21:29:09.135607+00:00",
+      "last_seen": "2026-10-18T21:29:09.135610+00:00"
+    },
+    "{\"direction\": -1, \"op\": \"news_attention\", \"params\": {\"n\": 3}}": {
+      "name": "news_attention_n3",
+      "spec": {
+        "name": "news_attention_n3",
+        "op": "news_attention",
+        "params": {
+          "n": 3
+        },
+        "direction": -1,
+        "rationale": "系统扫描 news_attention{'n': 3} dir=-1",
+        "source": "sweep"
+      },
+      "n_sessions": 2,
+      "oos_median": 1.0554,
+      "dsr_best": 1.0,
+      "pbo_best": 0.0,
+      "lf_net_median": null,
+      "first_promoted": "2026-10-18T21:29:09.135634+00:00",
+      "last_seen": "2026-10-18T21:29:09.135639+00:00"
+    },
+    "{\"direction\": 1, \"op\": \"downside_days\", \"params\": {\"n\": 60}}": {
+      "name": "downside_days_n60",
+      "spec": {
+        "name": "downside_days_n60",
+        "op": "downside_days",
+        "params": {
+          "n": 60
+        },
+        "direction": 1,
+        "rationale": "系统扫描 downside_days{'n': 60} dir=1",
+        "source": "sweep"
+      },
+      "n_sessions": 2,
+      "oos_median": 0.9978,
+      "dsr_best": 1.0,
+      "pbo_best": 0.0,
+      "lf_net_median": null,
+      "first_promoted": "2026-10-18T21:29:09.135646+00:00",
+      "last_seen": "2026-10-18T21:29:09.135649+00:00"
+    },
+    "{\"direction\": -1, \"expr\": {\"left\": {\"op\": \"price_position\", \"params\": {\"n\": 120}}, \"op\": \"div\", \"right\": {\"op\": \"vol\", \"params\": {\"n\": 60}}}}": {
+      "name": "price_pos_div_vol_d-1",
+      "spec": {
+        "name": "price_pos_div_vol_d-1",
+        "kind": "combo",
+        "expr": {
+          "op": "div",
+          "left": {
+            "op": "price_position",
+            "params": {
+              "n": 120
+            }
+          },
+          "right": {
+            "op": "vol",
+            "params": {
+              "n": 60
+            }
+          }
+        },
+        "direction": -1,
+        "rationale": "相对位置除以波动",
+        "source": "classic_combo"
+      },
+      "n_sessions": 2,
+      "n_distinct_oos": 1,
+      "oos_median": 3.4095,
+      "dsr_best": 1.0,
+      "pbo_best": 0.0,
+      "lf_net_median": null,
+      "first_promoted": "2026-10-19T01:45:27.515401+00:00",
+      "last_seen": "2026-10-19T01:45:27.515445+00:00"
+    },
+    "{\"direction\": -1, \"op\": \"xbrl_log_mcap\", \"params\": {}}": {
+      "name": "xbrl_log_mcap_-1",
+      "spec": {
+        "name": "xbrl_log_mcap_-1",
+        "op": "xbrl_log_mcap",
+        "params": {},
+        "direction": -1,
+        "rationale": "系统扫描 xbrl_log_mcap{} dir=-1",
+        "source": "sweep"
+      },
+      "n_sessions": 2,
+      "n_distinct_oos": 1,
+      "oos_median": 7.2878,
+      "dsr_best": 1.0,
+      "pbo_best": 0.0,
+      "lf_net_median": null,
+      "first_promoted": "2026-10-19T06:09:22.210700+00:00",
+      "last_seen": "2026-10-19T06:09:22.211301+00:00"
+    },
+    "{\"direction\": 1, \"op\": \"volume_price_corr\", \"params\": {\"n\": 120}}": {
+      "name": "volume_price_corr_n120",
+      "spec": {
+        "name": "volume_price_corr_n120",
+        "op": "volume_price_corr",
+        "params": {
+          "n": 120
+        },
+        "direction": 1,
+        "rationale": "系统扫描 volume_price_corr{'n': 120} dir=1",
+        "source": "sweep"
+      },
+      "n_sessions": 2,
+      "n_distinct_oos": 1,
+      "oos_median": 4.5356,
+      "dsr_best": 1.0,
+      "pbo_best": 0.0,
+      "lf_net_median": null,
+      "first_promoted": "2026-10-19T06:09:22.211336+00:00",
+      "last_seen": "2026-10-19T06:09:22.211342+00:00"
+    },
+    "{\"direction\": -1, \"op\": \"xbrl_gross_margin\", \"params\": {}}": {
+      "name": "xbrl_gross_margin_-1",
+      "spec": {
+        "name": "xbrl_gross_margin_-1",
+        "op": "xbrl_gross_margin",
+        "params": {},
+        "direction": -1,
+        "rationale": "系统扫描 xbrl_gross_margin{} dir=-1",
+        "source": "sweep"
+      },
+      "n_sessions": 2,
+      "n_distinct_oos": 1,
+      "oos_median": 3.63,
+      "dsr_best": 1.0,
+      "pbo_best": 0.0,
+      "lf_net_median": null,
+      "first_promoted": "2026-10-19T06:09:22.211364+00:00",
+      "last_seen": "2026-10-19T06:09:22.211368+00:00"
+    },
+    "{\"direction\": 1, \"op\": \"turnover_std\", \"params\": {\"n\": 120}}": {
+      "name": "turnover_std_n120",
+      "spec": {
+        "name": "turnover_std_n120",
+        "op": "turnover_std",
+        "params": {
+          "n": 120
+        },
+        "direction": 1,
+        "rationale": "系统扫描 turnover_std{'n': 120} dir=1",
+        "source": "sweep"
+      },
+      "n_sessions": 2,
+      "n_distinct_oos": 1,
+      "oos_median": 3.0155,
+      "dsr_best": 1.0,
+      "pbo_best": 0.0,
+      "lf_net_median": null,
+      "first_promoted": "2026-10-19T06:09:22.211374+00:00",
+      "last_seen": "2026-10-19T06:09:22.211377+00:00"
+    },
+    "{\"direction\": 1, \"op\": \"mom\", \"params\": {\"n\": 144, \"skip\": 12}}": {
+      "name": "long_mom_skip_recent_144",
+      "spec": {
+        "name": "long_mom_skip_recent_144",
+        "op": "mom",
+        "params": {
+          "n": 144,
+          "skip": 12
+        },
+        "direction": 1,
+        "rationale": "较长趋势（144日）剔除近月（12日）动量，捕捉期限结构中慢趋势延续、剔除短期反转噪音的部分，20日持有可承接机构调仓惯性。",
+        "source": "llm_batch"
+      },
+      "n_sessions": 2,
+      "n_distinct_oos": 1,
+      "oos_median": 5.4868,
+      "dsr_best": 0.9994,
+      "pbo_best": 0.0,
+      "lf_net_median": null,
+      "first_promoted": "2026-10-21T08:01:32.332117+00:00",
+      "last_seen": "2026-10-21T08:01:32.332837+00:00"
+    }
+  },
+  "updated_at": "2026-10-22T17:06:16.319628+00:00",
+  "n_candidates_seen": 259,
+  "cumulative_trials": 82663,
+  "redundancy_gate": {
+    "max_abs_corr": 0.8,
+    "max_library": 20,
+    "n_rejected_redundant": 48
+  },
+  "trial_accounting": {
+    "raw_trials": 82663,
+    "effective_trials": 114,
+    "families": {
+      "vol": 44,
+      "volatility_ratio": 21,
+      "hl_range": 20,
+      "mom": 16,
+      "turnover": 15,
+      "reversal": 15,
+      "skew": 9,
+      "price_position": 9,
+      "gap": 9,
+      "volume_ratio": 9,
+      "trend_strength": 7,
+      "turnover_std": 6
+    },
+    "n_families": 36
+  }
+}
