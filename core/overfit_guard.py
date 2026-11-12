@@ -229,21 +229,45 @@ def save_trials(d: dict) -> None:
 
 def record_session(n_candidates: int, n_survivors: int, market: str = "us",
                    note: str = "", extra: dict | None = None) -> dict:
-    """登记一次挖掘会话。返回累计试验数（累计候选总数）。
+    """登记一次挖掘会话。返回累计试验数。
 
     「累计候选总数」是 DSR 里 N 的保守下界估计 —— 每挖一个候选就是一次试验。
+
+    2026-10-23 修正：同一份数据窗口、同一批候选被重复计入 N，是「晋升停滞」的
+    统计根源之一。实测：`total_trials` 从 10-16 到 10-23 从 0 涨到 85041，而这
+    段时间面板窗口只前进了 6 个交易日；同一个 350~440 个候选的网格在同一个
+    1458 天窗口上被重跑十几轮，候选清单逐位相同，**真实新试验接近 0**，但 N 照样
+    每次全量累加 → DSR 惩罚线性加重 → 挖得越久越升不上去。
+
+    规则：会话带 `data_window_id` 时，只把**新窗口**的候选计入 N；
+    同窗口重跑时 N 不变（仍记一条会话，标注 counted=0，保留可审计性）。
+    老格式（没有窗口指纹）无从判断，只能照旧累加。
     """
     d = load_trials()
-    d["total_trials"] = int(d.get("total_trials", 0)) + int(n_candidates)
+    dwid = (extra or {}).get("data_window_id") if extra else None
+    seen_windows = set(d.get("windows") or [])
+    if dwid and dwid in seen_windows:
+        counted = 0
+        reason = "同一数据窗口重跑，候选集合未变 → 不计入试验数 N"
+    else:
+        counted = int(n_candidates)
+        reason = "新数据窗口"
+        if dwid:
+            seen_windows.add(dwid)
+    d["total_trials"] = int(d.get("total_trials", 0)) + counted
     sess = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "market": market, "n_candidates": int(n_candidates),
+        "n_counted": counted, "counted_reason": reason,
+        "data_window_id": dwid,
         "n_survivors": int(n_survivors), "note": note,
         "cumulative_trials_after": d["total_trials"],
     }
     if extra:
         sess.update(extra)
     d.setdefault("sessions", []).append(sess)
+    if seen_windows:
+        d["windows"] = sorted(seen_windows)
     save_trials(d)
     return d
 

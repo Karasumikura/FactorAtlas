@@ -1,0 +1,403 @@
+"""Internal: CombinatorialPurgedCV (Domain D5.4).
+
+See *Advances in Financial Machine Learning* (Lopez de Prado, Wiley 2018),
+chapter 12 section 12.4. The N-choose-K fold enumeration is paired with
+backtest path reconstruction (domain D6) via [`backtest_paths`][purgedcv.CombinatorialPurgedCV.backtest_paths].
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from itertools import combinations
+from math import comb
+from typing import Any
+
+import numpy as np
+import pandas as pd
+# vendored: 原版依赖 scikit-learn 只为 clone(estimator)（backtest_paths 用）。
+# 本项目只用 split() 拿索引，quant-lab venv 无 sklearn，故用 deepcopy 等价替代。
+import copy as _copy
+def clone(estimator):
+    return _copy.deepcopy(estimator)
+
+from purgedcv._base import BaseTemporalSplitter
+from purgedcv._paths import reconstruct_paths
+from purgedcv._time import HorizonLike
+from purgedcv._validation import _validate_integer
+
+from ._typing import NDArrayAny, TimesLike
+
+
+def _row_indexable(data: object) -> Any:
+    """Return ``data`` in a form whose rows can be taken by position.
+
+    pandas and polars objects are kept as they are, so column names and
+    dtypes reach the estimator (a ``ColumnTransformer`` that selects
+    columns by name needs them). Anything else becomes a NumPy array.
+    """
+    if hasattr(data, "iloc") or type(data).__module__.split(".")[0] == "polars":
+        return data
+    return np.asarray(data)
+
+
+def _take_rows(data: Any, idx: NDArrayAny) -> Any:
+    """Take rows ``idx`` (positions, not labels) from ``_row_indexable`` output."""
+    if hasattr(data, "iloc"):
+        return data.iloc[idx]
+    return data[idx]
+
+
+class CombinatorialPurgedCV(BaseTemporalSplitter):
+    """Combinatorial Purged Cross-Validation (fold enumeration).
+
+    Partitions the time-ordered samples into ``n_splits`` contiguous group
+    blocks. For each combination of ``n_test_groups`` chosen from those
+    blocks, yields one fold whose test indices are the union of the
+    chosen blocks. Total folds: ``C(n_splits, n_test_groups)``.
+
+    Each group block appears as test in exactly ``C(n_splits - 1,
+    n_test_groups - 1)`` folds.
+
+    The base class applies D2 purge and D3 embargo to each fold's train
+    set. [`backtest_paths`][purgedcv.CombinatorialPurgedCV.backtest_paths] then assembles the C(N,K) folds into
+    n_paths time-ordered out-of-sample sequences.
+
+    See *Advances in Financial Machine Learning* (Lopez de Prado, Wiley
+    2018), chapter 12 section 12.4, for the original method.
+
+    Examples:
+        >>> import numpy as np
+        >>> import pandas as pd
+        >>> from purgedcv import CombinatorialPurgedCV
+        >>> pred = pd.Series(pd.date_range("2024-01-01", periods=24, freq="D"))
+        >>> evalu = pred + pd.Timedelta(days=1)
+        >>> cv = CombinatorialPurgedCV(
+        ...     n_splits=6, n_test_groups=2,
+        ...     prediction_times=pred, evaluation_times=evalu,
+        ... )
+        >>> cv.get_n_splits()
+        15
+    """
+
+    def __init__(
+        self,
+        n_splits: int,
+        n_test_groups: int,
+        *,
+        prediction_times: TimesLike,
+        evaluation_times: TimesLike,
+        purge_horizon: HorizonLike | None = None,
+        embargo: HorizonLike | None = None,
+        embargo_observations: int | None = None,
+        embargo_fraction: float | None = None,
+    ) -> None:
+        """Configure a Combinatorial Purged CV splitter.
+
+        Args:
+            n_splits: Number of contiguous group blocks to partition the
+                samples into. Must be at least 2.
+            n_test_groups: Number of group blocks chosen as the test
+                set in each fold. Must be in ``[1, n_splits - 1]``.
+            prediction_times: Per-sample prediction times.
+            evaluation_times: Per-sample evaluation times.
+            purge_horizon: Symmetric padding around the test fold's
+                label window; training rows whose label horizon overlaps
+                the padded test horizon are dropped. ``None`` means no
+                purge.
+            embargo: Post-test embargo duration; training rows whose
+                prediction time falls in any closed window
+                ``[test_evaluation_time, test_evaluation_time + embargo]``
+                are dropped.
+                ``None`` means no embargo.
+            embargo_observations: Number of row positions to embargo after
+                each contiguous test block. Mutually exclusive with
+                ``embargo`` and ``embargo_fraction``.
+            embargo_fraction: Fraction of the full dataset to embargo after
+                each contiguous test block, rounded down. Mutually exclusive
+                with the other modes.
+
+        Raises:
+            ValueError: if ``n_splits < 2``, if ``n_splits`` exceeds the
+                number of samples, or if ``n_test_groups`` is not in
+                ``[1, n_splits - 1]``.
+        """
+        n_splits = _validate_integer("n_splits", n_splits, minimum=2)
+        n_test_groups = _validate_integer("n_test_groups", n_test_groups, minimum=1)
+        if n_test_groups >= n_splits:
+            raise ValueError(
+                f"n_test_groups must be in [1, n_splits-1] = [1, {n_splits - 1}], "
+                f"got {n_test_groups}."
+            )
+        super().__init__(
+            prediction_times=prediction_times,
+            evaluation_times=evaluation_times,
+            purge_horizon=purge_horizon,
+            embargo=embargo,
+            embargo_observations=embargo_observations,
+            embargo_fraction=embargo_fraction,
+        )
+        if n_splits > len(self._prediction_times):
+            raise ValueError(
+                f"n_splits={n_splits} exceeds n_samples={len(self._prediction_times)}; "
+                "CPCV requires non-empty group blocks."
+            )
+        self.n_splits = n_splits
+        self.n_test_groups = n_test_groups
+
+    def get_n_splits(
+        self,
+        X: object = None,  # noqa: N803
+        y: object = None,
+        groups: object = None,
+    ) -> int:
+        return comb(self.n_splits, self.n_test_groups)
+
+    def _iter_test_indices(self, n_samples: int) -> list[NDArrayAny]:
+        group_size, remainder = divmod(n_samples, self.n_splits)
+        cursor = 0
+        group_indices: list[NDArrayAny] = []
+        for k in range(self.n_splits):
+            sz = group_size + (1 if k < remainder else 0)
+            group_indices.append(np.arange(cursor, cursor + sz, dtype=np.int64))
+            cursor += sz
+        return [
+            np.concatenate([group_indices[i] for i in combo])
+            for combo in combinations(range(self.n_splits), self.n_test_groups)
+        ]
+
+    def backtest_paths(
+        self,
+        estimator: object,
+        X: NDArrayAny | pd.DataFrame,  # noqa: N803
+        y: NDArrayAny | pd.Series,
+    ) -> NDArrayAny:
+        """Fit ``estimator`` on each fold and reconstruct the C(N-1, K-1)
+        out-of-sample backtest paths.
+
+        For each of the C(N, K) folds:
+
+        1. Clone the estimator (so per-fold fits do not contaminate each
+           other or the original).
+        2. Fit on the fold's training set (after purge + embargo).
+        3. Predict on the fold's test set.
+        4. If the fold has no training rows under an unusually aggressive
+           purge/embargo configuration, the predictions for that fold are NaN.
+
+        The per-fold predictions are then handed to [`reconstruct_paths`][purgedcv.reconstruct_paths],
+        which assembles them into an ``(n_paths, n_samples)`` matrix where
+        each row is a complete time-ordered out-of-sample prediction
+        sequence.
+
+        Args:
+            estimator: A scikit-learn estimator with ``fit(X, y)`` and
+                ``predict(X)`` methods.
+            X: Feature matrix of shape ``(n_samples, n_features)``. A
+                pandas or polars DataFrame is passed to the estimator as a
+                DataFrame, so pipelines that select columns by name (for
+                example with ``ColumnTransformer``) work. Rows are taken by
+                position, so the index does not need to be sorted or unique.
+            y: Target vector of shape ``(n_samples,)``.
+
+        Returns:
+            ``(n_paths, n_samples)`` array of out-of-sample predictions
+            with ``n_paths = C(n_splits - 1, n_test_groups - 1)``. The array
+            is float when the predictions are numeric. When ``predict``
+            returns non-numeric values, such as string class labels, it is
+            an object array holding those values. Affected entries contain
+            NaN when an upstream fold could not be fit.
+
+        Raises:
+            AttributeError or TypeError: if ``estimator`` lacks ``fit`` or
+                ``predict``.
+            ValueError: if ``y`` does not match ``X`` in length, or if
+                ``predict`` does not return one value per test row.
+
+        Examples:
+            >>> import warnings
+            >>> import numpy as np
+            >>> import pandas as pd
+            >>> from sklearn.dummy import DummyRegressor
+            >>> from sklearn.exceptions import FitFailedWarning
+            >>> from purgedcv import CombinatorialPurgedCV
+            >>> pred = pd.Series(pd.date_range("2024-01-01", periods=16, freq="D"))
+            >>> evalu = pred + pd.Timedelta(days=1)
+            >>> cv = CombinatorialPurgedCV(
+            ...     n_splits=4, n_test_groups=2,
+            ...     prediction_times=pred, evaluation_times=evalu,
+            ... )
+            >>> X = np.arange(16).reshape(-1, 1).astype(float)
+            >>> y = np.arange(16).astype(float)
+            >>> with warnings.catch_warnings():
+            ...     warnings.simplefilter("ignore", FitFailedWarning)
+            ...     paths = cv.backtest_paths(DummyRegressor(strategy="mean"), X, y)
+            >>> paths.shape
+            (3, 16)
+        """
+        import warnings
+
+        from sklearn.exceptions import FitFailedWarning
+
+        n_samples = self._n_samples_or_check(X)
+        X_rows = _row_indexable(X)  # noqa: N806
+        y_rows = _row_indexable(y)
+        y_len = len(y_rows) if np.ndim(y_rows) else 0
+        if y_len != n_samples:
+            raise ValueError(f"y length {y_len} does not match X length {n_samples}.")
+
+        fold_test_indices = list(self._iter_test_indices(n_samples))
+        fold_predictions: list[NDArrayAny] = []
+        for train_idx, test_idx in self.split(X):
+            if len(train_idx) == 0:
+                warnings.warn(
+                    f"Fold has empty train set; predictions for "
+                    f"{len(test_idx)} test rows will be NaN.",
+                    FitFailedWarning,
+                    stacklevel=2,
+                )
+                fold_predictions.append(np.full(len(test_idx), np.nan, dtype=float))
+                continue
+            est = clone(estimator)
+            est.fit(_take_rows(X_rows, train_idx), _take_rows(y_rows, train_idx))
+            preds = np.asarray(est.predict(_take_rows(X_rows, test_idx)))
+            if preds.ndim != 1:
+                raise ValueError(
+                    f"backtest_paths expects 1-D predictions, one value per test "
+                    f"row, but {type(estimator).__name__}.predict returned shape "
+                    f"{preds.shape}. A backtest path holds a single prediction per "
+                    "sample; for multi-output models, run the folds yourself and "
+                    "call reconstruct_paths once per output."
+                )
+            fold_predictions.append(preds)
+
+        return reconstruct_paths(
+            fold_predictions,
+            fold_test_indices,
+            self.n_splits,
+            self.n_test_groups,
+            n_samples,
+        )
+
+    def reconstruct_paths(
+        self,
+        fold_predictions: Sequence[NDArrayAny],
+    ) -> NDArrayAny:
+        """Assemble per-fold predictions into the C(N-1, K-1) backtest paths.
+
+        Ergonomic wrapper around [`reconstruct_paths`][purgedcv.reconstruct_paths]. The
+        splitter already knows ``n_splits``, ``n_test_groups``, the fold
+        test-index layout, and ``n_samples`` (from the bound times), so the
+        caller supplies only one prediction array per fold, in
+        [`split`][purgedcv.BaseTemporalSplitter.split] order. Use this when you ran the fits yourself (for
+        example a per-fold backtest loop) rather than via
+        [`backtest_paths`][purgedcv.CombinatorialPurgedCV.backtest_paths].
+
+        Args:
+            fold_predictions: One array per fold, in the same order as
+                [`split`][purgedcv.BaseTemporalSplitter.split] yields folds; ``fold_predictions[f]`` holds
+                the predictions for that fold's test rows, in test-index
+                order. There must be ``C(n_splits, n_test_groups)`` arrays.
+
+        Returns:
+            ``(n_paths, n_samples)`` array of out-of-sample predictions with
+            ``n_paths = C(n_splits - 1, n_test_groups - 1)``.
+
+        Raises:
+            ValueError: on a fold-count or fold-prediction length mismatch
+                (propagated from [`reconstruct_paths`][purgedcv.reconstruct_paths]).
+
+        Examples:
+            >>> import numpy as np
+            >>> import pandas as pd
+            >>> from purgedcv import CombinatorialPurgedCV
+            >>> pred = pd.Series(pd.date_range("2024-01-01", periods=16, freq="D"))
+            >>> evalu = pred + pd.Timedelta(days=1)
+            >>> cv = CombinatorialPurgedCV(
+            ...     n_splits=4, n_test_groups=2,
+            ...     prediction_times=pred, evaluation_times=evalu,
+            ... )
+            >>> X = np.zeros((16, 1))
+            >>> fold_preds = [
+            ...     np.full(len(test), float(i))
+            ...     for i, (_, test) in enumerate(cv.split(X))
+            ... ]
+            >>> cv.reconstruct_paths(fold_preds).shape
+            (3, 16)
+        """
+        n_samples = len(self._prediction_times)
+        fold_test_indices = list(self._iter_test_indices(n_samples))
+        return reconstruct_paths(
+            fold_predictions,
+            fold_test_indices,
+            self.n_splits,
+            self.n_test_groups,
+            n_samples,
+        )
+
+
+class CombinatoriallySymmetricCV(CombinatorialPurgedCV):
+    """Combinatorially Symmetric Cross-Validation (CSCV).
+
+    The special case of [`CombinatorialPurgedCV`][purgedcv.CombinatorialPurgedCV] with
+    ``n_test_groups = n_splits // 2``: every fold cuts the timeline into two
+    equal halves, one in-sample and one out-of-sample. CSCV is the substrate
+    of [`probability_of_backtest_overfitting`][purgedcv.probability_of_backtest_overfitting]; expose it
+    directly when you want the symmetric IS/OOS folds without going through
+    the PBO estimator.
+
+    See *Advances in Financial Machine Learning* (Lopez de Prado, Wiley
+    2018), chapter 11.
+
+    Examples:
+        >>> import pandas as pd
+        >>> from purgedcv import CombinatoriallySymmetricCV
+        >>> pred = pd.Series(pd.date_range("2024-01-01", periods=24, freq="D"))
+        >>> evalu = pred + pd.Timedelta(days=1)
+        >>> cv = CombinatoriallySymmetricCV(
+        ...     n_splits=6, prediction_times=pred, evaluation_times=evalu,
+        ... )
+        >>> cv.get_n_splits()
+        20
+    """
+
+    def __init__(
+        self,
+        n_splits: int,
+        *,
+        prediction_times: TimesLike,
+        evaluation_times: TimesLike,
+        purge_horizon: HorizonLike | None = None,
+        embargo: HorizonLike | None = None,
+        embargo_observations: int | None = None,
+        embargo_fraction: float | None = None,
+    ) -> None:
+        """Configure a CSCV splitter.
+
+        Args:
+            n_splits: Number of contiguous group blocks. Must be even and
+                at least 2; half are chosen as the test (out-of-sample)
+                groups in each fold.
+            prediction_times: Per-sample prediction times.
+            evaluation_times: Per-sample evaluation times.
+            purge_horizon: Optional purge horizon applied per fold.
+            embargo: Optional embargo horizon applied per fold.
+            embargo_observations: Optional number of post-test row positions
+                embargoed per contiguous block.
+            embargo_fraction: Optional fraction of the dataset embargoed as
+                row positions per contiguous block.
+
+        Raises:
+            ValueError: if ``n_splits`` is odd or below 2.
+        """
+        n_splits = _validate_integer("n_splits", n_splits, minimum=2)
+        if n_splits % 2 != 0:
+            raise ValueError(f"CSCV requires an even n_splits, got {n_splits}.")
+        super().__init__(
+            n_splits=n_splits,
+            n_test_groups=n_splits // 2,
+            prediction_times=prediction_times,
+            evaluation_times=evaluation_times,
+            purge_horizon=purge_horizon,
+            embargo=embargo,
+            embargo_observations=embargo_observations,
+            embargo_fraction=embargo_fraction,
+        )

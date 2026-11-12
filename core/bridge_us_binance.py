@@ -38,6 +38,10 @@ from data.us_meta import sec_sector_map
 PROJ = Path(__file__).resolve().parent.parent
 STATE = PROJ / "data" / "binance" / "demo_positions.json"
 
+# 最近一次 compute_targets 算出的资金费率净成本估算（记账用，不改仓位）。
+# 结构见 _funding_view()：{net_ann_pct, per_hold_pct, hold_days, legs_...}
+LAST_FUNDING_VIEW: dict | None = None
+
 # 交易所真实下单门槛（minNotional）。这是【交易所规则】，不是我定的参数。
 # 优先从 exchangeInfo 动态读取；失败才退回一个保守默认。
 _MIN_NOTIONAL_CACHE: dict = {}
@@ -92,7 +96,7 @@ def compute_targets(spec: dict, as_of: str, quantile: float = 0.2,
                     gross_exposure: float = 1.0,
                     testnet: bool = True, neutralize: str = "none",
                     max_legs: int = 0, equity: float | None = None,
-                    top_per_side: int = 0) -> list[Target]:
+                    top_per_side: int = 0, hold: int = 20) -> list[Target]:
     """在 as_of 日，用因子在「目标环境可交易」的标的中选多空两端，给出目标权重。
 
     只使用 as_of 及之前的数据（严格无前视）。
@@ -162,7 +166,7 @@ def compute_targets(spec: dict, as_of: str, quantile: float = 0.2,
             scale = gross_exposure / tot_w if tot_w else 0.0
             for tgt in targets:
                 tgt.weight *= scale
-            return targets, str(t_use.date())
+            return _apply_funding_view(targets, t_use, hold)
 
     # ── 全信号驱动选股：唯一的硬约束是【总额 ≤ equity】+【单笔 ≥ 交易所 minNotional】
     #   其余全是自由的：
@@ -173,7 +177,7 @@ def compute_targets(spec: dict, as_of: str, quantile: float = 0.2,
     #   没有任何"每腿至少 $X""最多 N 腿"的人造参数。
     mu, sd = float(fv.mean()), float(fv.std() or 0)
     if sd < 1e-9:
-        return [], str(t_use.date())
+        return _apply_funding_view([], t_use, hold)
     z = {tk: (float(fv[tk]) - mu) / sd for tk in fv.index}
 
     # 入选：多头=因子为正、空头=因子为负（不做人为"前 N 只"筛选）。
@@ -183,17 +187,9 @@ def compute_targets(spec: dict, as_of: str, quantile: float = 0.2,
     longs_all = [tk for tk in order if float(fv[tk]) > 0]
     shorts_all = [tk for tk in reversed(order) if float(fv[tk]) < 0]
     if not longs_all and not shorts_all:
-        return [], str(t_use.date())
+        return _apply_funding_view([], t_use, hold)
 
-    # 权重用排名倒数（1, 1/2, 1/3, ...）：最强的拿最大份额，越弱越少。
-    #   配合下方"剩余预算递减"贪心：钱自然集中到最强几只，弱的因不够门槛被淘汰。
-    def _score(tks: list) -> dict:
-        if not tks:
-            return {}
-        return {tk: 1.0 / (i + 1) for i, tk in enumerate(tks)}
-
-    score_long = _score(longs_all)
-    score_short = _score(shorts_all)
+    # 份额按信号强度分配（见下方 _score），不再用排名倒数摊薄。
 
     # 总敞口由信号强度决定（不强求满仓）
     def _strength(tks: list) -> float:
@@ -205,8 +201,51 @@ def compute_targets(spec: dict, as_of: str, quantile: float = 0.2,
     s_long, s_short = _strength(longs_all), _strength(shorts_all)
     strength_both = max(s_long, s_short)
     n_sides = (1 if longs_all else 0) + (1 if shorts_all else 0)
-    gross_frac = (0.5 + 0.5 * strength_both) if n_sides == 2 else (0.6 + 0.4 * strength_both)
-    budget = equity * gross_exposure * gross_frac  # 本次总预算（≤equity）
+    # ── 份额由【信号强度】决定，不按名次摊薄 ──
+    # 2026-10-24 改（用户口径）：
+    #   "信号弱就少投"是对的，但**不许按腿平均分**。每只票投多少只该由它自己的
+    #   信号强度决定——信号最强的那只占满 100% 账户也合理。
+    #   原实现用 1/(i+1) 排名倒数 → 第1名 1、第2名 0.5、第3名 0.33…，
+    #   这是典型的"分腿均摊"，最强票被后面的弱票稀释，$100 只能落到 $29.6。
+    #   现在改为：份额 ∝ 该票的强度（z 值超出阈值部分），强票自然吃掉大头。
+    def _score(tks: list, sign: int) -> dict:
+        """份额 = 该方向的信号强度（与方向一致的 z 值）。
+
+        2026-10-24 修：原来用 abs(z)，负号被吃掉 →
+        TSLA(z=-1.24)、QQQ(-1.14) 这类本该做空的票被算成多头买入。
+        现在按方向取号：多头要 z>0，空头取 -z（即 z<0 的绝对值）。
+        """
+        if not tks:
+            return {}
+        out = {}
+        for tk in tks:
+            v = float(z[tk]) * sign          # 多头=+z，空头=-z
+            if v > 0:
+                out[tk] = v
+        return out
+
+    score_long = _score(longs_all, +1)
+    score_short = _score(shorts_all, -1)
+
+    # 强度仍决定「这一侧要不要出手 / 出多少手」的总体节奏：
+    #   整体信号弱 → gross_frac 小 → 少投；信号强 → 接近满仓。
+    #   注意：这是**整体**折扣，不是按腿摊薄。单只票依然可以吃掉全部预算。
+    def _strength(tks: list) -> float:
+        if not tks:
+            return 0.0
+        avg = sum(abs(z[tk]) for tk in tks) / len(tks)
+        return min(1.0, max(0.35, avg / 2.0))
+
+    s_long, s_short = _strength(longs_all), _strength(shorts_all)
+    strength_both = max(s_long, s_short)
+    n_sides = (1 if longs_all else 0) + (1 if shorts_all else 0)
+    # 用户铁律（2026-10-24 原话）："我不允许你有分腿，每一腿一定要投多少……
+    # 你投多少不是根据信号强弱来的吗？信号强你投 100，占 100% 都没关系。"
+    # → 份额只由强度决定，不做按腿摊薄，也不做整体强度折扣。
+    # → 总值 $100 是硬上限，绝不放大（budget = equity，gross_exposure 只允许 ≤1）。
+    gross_frac = 1.0
+    budget = equity * min(1.0, gross_exposure) * gross_frac
+
 
     # ── 用真实价格把"预算"分配成"整数手"：从最强的开始，把每腿预算分配到
     #    至少能下一手（≥minNotional），分不完的预算不再硬塞 → 自然决定腿数。 ──
@@ -218,45 +257,106 @@ def compute_targets(spec: dict, as_of: str, quantile: float = 0.2,
         px = {}
 
     def _allocate(scores: dict, sign: int) -> list[tuple]:
-        """贪心分配：从最强开始，每腿分【当前剩余预算】的一定比例，直到钱不够门槛。
+        """按【信号强度】分配：每腿金额 ∝ 它自己的强度。
 
-        无任何"取前 N 只/每腿至少 $X"的人造常量。规则：
-          * 按信号排名，第 k 个候选分到 剩余预算 × (该腿权重 / 已排序权重和)
-          * 分到的钱 < 交易所门槛 → 跳过（信号不够强，不值得占一腿）
-          * 预算耗尽 → 停止
+        用户口径（2026-10-24）：不许按腿平均、不许按名次摊薄。
+        每只票投多少只由它自己的信号强度决定 —— 最强的那只可以吃掉全部预算。
+          * 该腿应得 = 该侧预算 × (自身强度 / 该侧强度总和)
+          * 应得金额 < 交易所门槛 → 跳过（信号太弱，不值得占一腿）
+          * 被跳过的额度回流给剩下的强票，最终由最强票吸收
         """
         if not scores:
             return []
-        tot = sum(scores.values()) or 1.0
         side_budget = budget / max(1, n_sides)
-        picked = []
+        live = {tk: s for tk, s in scores.items() if px.get(tk, 0) > 0}
+        picked: list[tuple] = []
         remaining = side_budget
-        for tk, s in sorted(scores.items(), key=lambda kv: -kv[1]):
-            if remaining < min_notional:
+        while live and remaining >= min_notional:
+            tot = sum(live.values()) or 1.0
+            # 本轮按强度切分当前剩余预算
+            alloc = {tk: remaining * (s / tot) for tk, s in live.items()}
+            # 够门槛的按份额拿下；不够门槛的淘汰，额度回流下一轮
+            good = {tk: a for tk, a in alloc.items() if a >= min_notional}
+            if not good:
+                # 没有一个够门槛 → 剩下的钱全给最强的那个（它信号最强，配得上）
+                top = max(live, key=lambda tk: live[tk])
+                if remaining >= min_notional:
+                    picked.append((top, sign, remaining, px[top]))
+                    remaining = 0.0
                 break
-            p = px.get(tk, 0)
-            if p <= 0:
-                continue
-            alloc = remaining * (s / tot)
-            if alloc < min_notional:
-                # 该腿应得的钱不够门槛 → 跳过；但若它是唯一候选，就把剩余给它
-                if not picked:
-                    alloc = remaining
-                else:
-                    continue
-            picked.append((tk, sign, alloc, p))
-            remaining -= alloc
-            tot -= s  # 剩余候选的权重和相应减少
+            for tk, a in good.items():
+                picked.append((tk, sign, a, px[tk]))
+                remaining -= a
+            live = {tk: s for tk, s in live.items() if tk not in good}
         return picked
 
     picks = _allocate(score_long, +1) + _allocate(score_short, -1)
     if not picks:
-        return [], str(t_use.date())
+        return _apply_funding_view([], t_use, hold)
 
     for tk, sign, alloc, p in picks:
+        # 权重 = 分配金额 / equity。**不再除以 gross_exposure**：
+        # budget 已经用 min(1.0, gross_exposure) 封顶，此处再除一次会把敞口缩小
+        # （实测 gross_exposure=2.0 时算出 $50）。用户要求总值严格等于 equity。
         targets.append(Target(tk, sym_by_ticker[tk].binance_symbol,
-                              sign * (alloc / equity) / gross_exposure,
+                              sign * (alloc / equity),
                               float(fv[tk])))
+    return _apply_funding_view(targets, t_use, hold)
+
+
+# 持仓资金费率净成本（年化）。币安美股永续每 8h 结一次，多头付、空头收。
+# 实测（2026-10-23，30 个可映射标的、quantile=0.2、hold=20）：中性情形两腿
+# 合计年化净付出 7.67%，最坏 17.8%。而每期（20 交易日）约 0.61% ——— 对 $100
+# 本金、单笔中位 $6.8 的账户来说，这已经是决定性的量级；回测里却完全没扣。
+# 这里只做**记账**，不改目标仓位：仓位口径一旦变动，回测与实盘就对不上了。
+def _funding_view(targets: list[Target], t_use, hold: int = 20) -> dict:
+    """按当前多空腿估算本组合的资金费率净成本（年化 + 每期）。算不出就返回 None。"""
+    if not targets:
+        return None
+    try:
+        from core import funding_cost as fc
+        from core.us_mapping import build_mapping
+        mapped, _ = build_mapping()
+        by_ticker = {m.binance_symbol: m.us_ticker for m in mapped}
+        stats = {s.symbol: s for s in fc.all_funding_stats()}
+        long_r, short_r, covered, missing = [], [], 0, []
+        for t in targets:
+            st = stats.get(t.binance_symbol)
+            if st is None:
+                missing.append(by_ticker.get(t.binance_symbol) or t.binance_symbol)
+                continue
+            covered += 1
+            if t.weight > 0:
+                long_r.append(st.ann_long)          # 多头付
+            elif t.weight < 0:
+                short_r.append(-st.ann_short)       # 空头收 → 等价成本 -ann_short
+        if not covered:
+            return None
+        # 缺费率数据的腿按「两腿均值」保守补齐，避免低估成本
+        all_known = list(stats.values())
+        avg = (sum(s.ann_long for s in all_known) / len(all_known)) if all_known else 0.0
+        while len(long_r) + len(short_r) < len(targets):
+            long_r.append(avg)
+        lm = sum(long_r) / len(long_r) if long_r else 0.0
+        sm = sum(short_r) / len(short_r) if short_r else 0.0
+        net_ann = lm + sm
+        return {
+            "net_ann_pct": round(net_ann * 100, 2),
+            "per_hold_pct": round(net_ann * hold / 252 * 100, 3),
+            "hold_days": hold,
+            "legs_covered": covered,
+            "legs_total": len(targets),
+            "missing_symbols": missing[:5],
+            "as_of": str(getattr(t_use, "date", lambda: t_use)()),
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}"[:120]}
+
+
+def _apply_funding_view(targets: list[Target], t_use, hold: int = 20):
+    """把资金费率估算挂到模块级，供调用方记账（不改目标权重）。"""
+    global LAST_FUNDING_VIEW
+    LAST_FUNDING_VIEW = _funding_view(targets, t_use, hold=hold)
     return targets, str(t_use.date())
 
 
@@ -283,16 +383,19 @@ def load_positions() -> dict[str, float]:
     return {}
 
 
-def load_positions_from_exchange(testnet: bool = True) -> dict[str, float]:
+def load_positions_from_exchange(testnet: bool = True,
+                                 book: str | None = None) -> dict[str, float]:
     """从交易所读【真实持仓】。这是调仓的正确依据。
 
     为什么必须这样做：本地状态文件会与实际持仓脱节（换环境、手工平仓、
     之前会话遗留等）。用它算 delta 会导致重复开仓/漏平。
+
+    book: 指定账本 → 读该盘所属币安账户的持仓（赛马隔离下各盘账户不同）。
     返回 {binance_symbol: signed_qty}，只含非零仓位。
     """
     from core.binance_exec import BinanceExec
     try:
-        ex = BinanceExec.from_env(testnet=testnet)
+        ex = BinanceExec.from_env(testnet=testnet, book=book)
         out: dict[str, float] = {}
         for p in ex.positions():
             amt = float(p.get("positionAmt", 0) or 0)
@@ -317,12 +420,20 @@ def force_derisk(targets: list[Target], equity: float, prices: dict[str, float],
     """回撤熔断下的**主动降险**：把目标敞口按回撤比例强制压缩，只产出减仓单。
 
     与仅"拦截加仓"的被动做法不同，这里主动把 gross 压到
-    ``target_gross = gross_cap × equity × (1 - drawdown_pct)`` 以下，
-    并逐腿向该上限缩减（减少 abs(target_qty)，绝不增加任何腿；
+    ``target_gross = min(gross_cap × equity, 当前 gross) × (1 - drawdown_pct)``
+    以下，并逐腿向该上限缩减（减少 abs(target_qty)，绝不增加任何腿；
     也不新开方向相反的腿 —— 那会引入新风险）。
 
     为什么需要它：无人值守时若 LLM 说 HOLD，被动闸门就等于没有止损。
     主动降险保证「浮亏越深，敞口越薄」，把回撤风险真正关掉。
+
+    2026-11-01 两处修复（此前熔断器实际是摆设）：
+      1. 目标上限加了 ``min(..., cur_gross)``。原来只用 gross_cap×equity，
+         低仓位账本（gross 0.57x）下目标 107U 永远高于实际 56.6U，
+         判定「敞口已够低」直接返回空单，一腿都减不掉。
+      2. 真正使用 ``min_notional``。低仓位时按比例微调每腿只有 0.3~1.7U，
+         全部低于交易所最小名义额 → 发出去必被拒。现在先跳过这些腿，
+         再**整腿平掉**最小的几条腿来补足降险量（仍然只减不加、不翻向）。
 
     derisk_floor：压缩后单腿目标占总敞口的比例下限（0=可一路压到平）。
     """
@@ -330,21 +441,30 @@ def force_derisk(targets: list[Target], equity: float, prices: dict[str, float],
     if equity <= 0 or drawdown_pct <= 0:
         return orders
 
-    # 允许的目标总敞口：回撤越深，压得越狠
-    dd = min(max(drawdown_pct, 0.0), 0.95)
-    target_gross = gross_cap * equity * (1.0 - dd)
-
-    # 当前总敞口（按有报价的腿计）
+    # 当前总敞口（按有报价的腿计）—— 必须先算出来，目标上限要用
     cur_gross = 0.0
     for sym, q in cur_positions.items():
         px = prices.get(sym)
         if px and px > 0:
             cur_gross += abs(float(q) * px)
 
+    # 允许的目标总敞口：回撤越深，压得越狠；上限不超过仓位上限，
+    # 也不超过当前敞口（否则低仓位账本永远不会触发减仓）。
+    dd = min(max(drawdown_pct, 0.0), 0.95)
+    target_gross = min(gross_cap * equity, cur_gross) * (1.0 - dd)
+
     if cur_gross <= target_gross + 1e-9:
         return orders  # 敞口已足够低，无需主动降险
 
+    need_reduce = cur_gross - target_gross
     scale = target_gross / cur_gross   # < 1.0
+
+    def snap(x: float) -> float:
+        return math.copysign(
+            math.floor(abs(x) / step) * step if step > 0 else abs(x), x) if x else 0.0
+
+    picked: dict[str, Order] = {}
+    planned = 0.0                     # 已规划缩减的名义额
 
     for sym, cur in sorted(cur_positions.items()):
         px = prices.get(sym)
@@ -355,26 +475,54 @@ def force_derisk(targets: list[Target], equity: float, prices: dict[str, float],
         if derisk_floor > 0:
             floor_abs = (derisk_floor * target_gross) / px
             new_abs = max(new_abs, min(floor_abs, abs(cur)))
-        new_qty = math.copysign(new_abs, cur)
-
-        def snap(x: float) -> float:
-            return math.copysign(
-                math.floor(abs(x) / step) * step if step > 0 else abs(x), x) if x else 0.0
-
-        tq_s = snap(new_qty)
-        delta = tq_s - cur            # 必然与 cur 反向（减仓），除非不足一手
-        delta_s = snap(delta)
+        tq_s = snap(math.copysign(new_abs, cur))
+        delta_s = snap(tq_s - cur)     # 必然与 cur 反向（减仓），除非不足一手
         if abs(delta_s) < (step / 2 if step else 1e-9):
-            continue              # 缩减量不足一手，跳过
+            continue                   # 缩减量不足一手，跳过
+        notional = abs(delta_s * px)
+        if notional < min_notional:
+            continue                   # 低于交易所最小名义额，发出必被拒 → 交给兜底
+        picked[sym] = Order(
+            binance_symbol=sym, side="BUY" if delta_s > 0 else "SELL",
+            target_weight=0.0, target_qty=tq_s, cur_qty=cur, delta_qty=delta_s,
+            ref_price=px, notional=notional,
+            action="CLOSE" if abs(tq_s) < 1e-9 else "REDUCE",
+        )
+        planned += notional
 
-        side = "BUY" if delta_s > 0 else "SELL"
-        act = "CLOSE" if abs(tq_s) < 1e-9 else "REDUCE"
-        orders.append(Order(
-            binance_symbol=sym, side=side, target_weight=0.0, target_qty=tq_s,
-            cur_qty=cur, delta_qty=delta_s, ref_price=px,
-            notional=abs(delta_s * px), action=act,
-        ))
+    # 兜底：整腿平掉最小的几条腿。低仓位账本上按比例微调往往每一腿都
+    # < min_notional（实测 7 腿 0.31~1.71U，全被拒），此时只有整腿平仓
+    # 才真正降得下来。约束：平完后剩余 gross 不低于 target 的 50%，
+    # 避免一次砍太狠；仍然只减不加、方向不翻。
+    if planned < need_reduce - 1e-9:
+        cands: list[tuple[float, str, float, float]] = []
+        for sym, cur in cur_positions.items():
+            px = prices.get(sym)
+            if not px or px <= 0 or abs(cur) < 1e-9 or sym in picked:
+                continue
+            n = abs(cur * px)
+            if n >= min_notional:
+                cands.append((n, sym, cur, px))
+        cands.sort(key=lambda t: t[0])
+        floor_gross = target_gross * 0.5
+        remaining = cur_gross
+        for n, sym, cur, px in cands:
+            if planned >= need_reduce - 1e-9:
+                break
+            if remaining - n < floor_gross:
+                break
+            dq = snap(-cur)
+            if abs(dq) < 1e-9:
+                continue
+            picked[sym] = Order(
+                binance_symbol=sym, side="BUY" if dq > 0 else "SELL",
+                target_weight=0.0, target_qty=0.0, cur_qty=cur, delta_qty=dq,
+                ref_price=px, notional=abs(dq * px), action="CLOSE",
+            )
+            planned += abs(dq * px)
+            remaining -= abs(cur * px)
 
+    orders = list(picked.values())
     prio = {"CLOSE": 0, "REDUCE": 1}
     orders.sort(key=lambda o: prio.get(o.action, 9))
     return orders
@@ -423,8 +571,16 @@ def build_orders(targets: list[Target], equity: float, prices: dict[str, float],
 
         # 吸附到 step
         def snap(x: float) -> float:
-            return math.copysign(
-                math.floor(abs(x) / step) * step if step > 0 else abs(x), x) if x else 0.0
+            if not x:
+                return 0.0
+            if step <= 0:
+                return x
+            # 2026-10-24 修复：直接 floor(abs(x)/step) 会被浮点误差咬掉一整步。
+            # 例：持仓被算成 0.009999999999999998，/0.01 = 0.9999999999999998，
+            # floor → 0 → 平仓单变成 0 张，残留腿永远清不掉（实测 GOOGLUSDT）。
+            # 先按 step 精度四舍五入到「多少个 step」，再 floor，避免这类误差。
+            n_steps = round(abs(x) / step, 6)
+            return math.copysign(math.floor(n_steps + 1e-9) * step, x)
 
         delta_s = snap(delta)
         tq_s = snap(t_qty)
@@ -477,13 +633,21 @@ def build_orders(targets: list[Target], equity: float, prices: dict[str, float],
 # 执行
 # ---------------------------------------------------------------------------
 def execute_orders(orders: list[Order], testnet: bool = True, leverage: int = 1,
-                   max_notional: float = 500.0, dry: bool = True) -> list[dict]:
-    """发单。dry=True 只打印。返回成交记录。"""
+                   max_notional: float = 500.0, dry: bool = True,
+                   position_side: str | None = None,
+                   book: str | None = None) -> list[dict]:
+    """发单。dry=True 只打印。返回成交记录。
+
+    position_side: 双向持仓模式（Hedge Mode）下用来隔离策略；
+      单向模式下传 None 即可（币安会用 BOTH）。
+    book: 账本名 → 决定用哪个币安账户（见 binance_exec._BOOK_ACCOUNT）。
+      赛马隔离的核心：每个盘在自己的账户上交易，物理隔离持仓。
+    """
     results: list[dict] = []
     exec_client = None
     if not dry:
         from core.binance_exec import BinanceExec
-        exec_client = BinanceExec.from_env(testnet=testnet)
+        exec_client = BinanceExec.from_env(testnet=testnet, book=book)
         exec_client.ping()
 
     for o in orders:
@@ -497,15 +661,23 @@ def execute_orders(orders: list[Order], testnet: bool = True, leverage: int = 1,
             "ts": datetime.now(timezone.utc).isoformat(),
         }
         if dry or o.notional < 5.0:
-            rec["status"] = "dry-run"
+            # 两种「没发出去」要分开记：dry 是运行模式，notional<5 是交易所最小名义额
+            # 卡死的粉尘单。混成同一个 "dry-run" 会让人以为守护进程没加 --live。
+            # 2026-10-30 实测：GOOGL 0.01 股（≈2.8U）平仓单连续 53/60 个 tick 卡在这里。
+            rec["status"] = "dry-run" if dry else "dust_skip"
+            if not dry:
+                rec["note"] = f"名义 {o.notional:.2f} < 最小下单额 5.0，未发单"
             results.append(rec)
             continue
         try:
             if exec_client:
                 exec_client.set_leverage(o.binance_symbol, leverage)
-            r = exec_client.place_order(o.binance_symbol, o.side, "MARKET",
-                                        quantity=abs(o.delta_qty)) if exec_client else {}
+            r = exec_client.place_order(
+                o.binance_symbol, o.side, "MARKET",
+                quantity=abs(o.delta_qty),
+                position_side=position_side) if exec_client else {}
             rec["status"] = "sent"
+            rec["position_side"] = position_side
             rec["resp"] = {k: r.get(k) for k in ("orderId", "status", "avgPrice", "executedQty")}
         except Exception as e:  # noqa: BLE001
             rec["status"] = "error"
@@ -514,13 +686,20 @@ def execute_orders(orders: list[Order], testnet: bool = True, leverage: int = 1,
 
     # 真实发单时，把成交写入台账，供 demo_reconcile 对账
     if not dry and exec_client is not None:
-        _write_ledger(results)
+        _write_ledger(results, book)
     return results
 
 
-def _write_ledger(results: list[dict]) -> None:
+def _write_ledger(results: list[dict], book: str | None = None) -> None:
+    """写成交台账。
+
+    必须按账本分开写：赛马隔离后两盘各用自己的账户，
+    台账混在同一个文件里会让对账/统计把 A 盘的成交算进 B 盘。
+    """
     try:
-        from core.demo_reconcile import append_ledger
+        from core.demo_reconcile import append_ledger, set_book
+        if book:
+            set_book(book)
         sent = [r for r in results if r.get("status") == "sent"]
         if sent:
             append_ledger(sent)

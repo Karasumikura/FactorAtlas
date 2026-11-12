@@ -229,18 +229,29 @@ def build_prompt_messages(ctx: dict) -> list[dict]:
 # 3) 调用 LLM 并解析
 # ---------------------------------------------------------------------------
 def _fallback_parse_orders(text: str) -> dict:
-    """LLM 不守格式时兜底：能抠出 orders 数组就抠，抠不出就当空单（保守）。"""
+    """LLM 不守格式时兜底：能抠出 orders 数组就抠，抠不出才算「解析失败」。
+
+    2026-10-23 修：`_ok` 的判据必须是「LLM 有没有给出可用的判断」，不能取决于
+    「能不能解析出 orders 字段」。上一版把解析失败也返回成 orders=[]，
+    llm_decide_orders 随后就把 _ok 置 True —— 一次 LLM 故障会被记成
+    「LLM 主动决定不交易」，降级链失效且日志里看不出来。
+    """
     t = (text or "")
+    _fail = {"orders": [], "reason": "无法解析 LLM 输出，保守不下单",
+             "_parse_error": True, "_unparsed": t[:300]}
+    if not t.strip():
+        _fail["reason"] = "LLM 返回空内容"
+        return _fail
     try:
         from llm.client import extract_json
         parsed = extract_json(t)
-        if isinstance(parsed, dict) and "orders" in parsed:
+        if isinstance(parsed, dict) and isinstance(parsed.get("orders"), list):
             return parsed
         if isinstance(parsed, list):
             return {"orders": parsed, "reason": "LLM 直接给了数组"}
     except Exception:  # noqa: BLE001
-        pass
-    return {"orders": [], "reason": "无法解析 LLM 输出，保守不下单", "_unparsed": t[:300]}
+        return _fail
+    return _fail
 
 
 def llm_decide_orders(ctx: dict, *, model: str | None = None,
@@ -266,8 +277,10 @@ def llm_decide_orders(ctx: dict, *, model: str | None = None,
         if not isinstance(out, dict) or "orders" not in out:
             out = _fallback_parse_orders(raw)
         out["_raw"] = (raw or "")[:600]
-        # 能走到这里且 orders 是列表 → LLM 真的给了判断
-        out["_ok"] = isinstance(out.get("orders"), list)
+        # 能走到这里且 orders 是列表 → 真的给了可用判断；
+        # 「抠不出 orders / 内容为空」是解析失败，必须回落到脚本订单。
+        out["_ok"] = (isinstance(out.get("orders"), list)
+                      and not out.get("_parse_error"))
         if not out["_ok"]:
             out["reason"] = out.get("reason") or "LLM 输出无法解析为 orders 列表"
         return out

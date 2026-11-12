@@ -118,17 +118,23 @@ def trend_strength(panel, n=40):
 
 # ---------- A股/散户市场特色算子 ----------
 def downside_vol(panel, n=20):
-    """下行波动：只统计负收益的波动（A股恐慌敏感）。"""
+    """下行波动：只统计负收益的波动（A股恐慌敏感）。
+
+    2026-10-24 修：原实现 `neg = r.where(r < 0)` 把非负收益置 NaN，
+    再由 `rolling(n).std()` 计算 —— 而 rolling 默认 min_periods=window，
+    窗口里只要有一天收益为正整段就全是 NaN，导致该因子**在所有市场上恒为全空**。
+    现在显式允许部分缺失（min_periods = n//2）。
+    """
     r = panel["c"].pct_change()
     neg = r.where(r < 0)
-    return neg.rolling(n).std()
+    return neg.rolling(n, min_periods=max(3, n // 2)).std()
 
 
 def upside_vol(panel, n=20):
-    """上行波动：只统计正收益的波动。"""
+    """上行波动：只统计正收益的波动。（同 downside_vol，修 min_periods）"""
     r = panel["c"].pct_change()
     pos = r.where(r > 0)
-    return pos.rolling(n).std()
+    return pos.rolling(n, min_periods=max(3, n // 2)).std()
 
 
 def vol_asym(panel, n=20):
@@ -242,6 +248,20 @@ except Exception:
 try:
     from factors.xbrl_fund import XBRL_OPS
     OPS.update(XBRL_OPS)
+except Exception:
+    pass
+
+# SEC EDGAR 申报事件因子（免费、精确申报日、next-trading-day 对齐、无前视）
+try:
+    from factors.edgar_event import EDGAR_OPS
+    OPS.update(EDGAR_OPS)
+except Exception:
+    pass
+
+# 另类数据因子（FINRA 空头量 / Wikipedia 关注度，免费官方源、无前视对齐）
+try:
+    from factors.alt_data import ALT_OPS
+    OPS.update(ALT_OPS)
 except Exception:
     pass
 

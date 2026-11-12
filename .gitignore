@@ -39,3 +39,9 @@ __pycache__/
 .idea/
 .DS_Store
 *.swp
+
+
+
+
+state/
+data/crypto/

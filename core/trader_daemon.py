@@ -32,6 +32,13 @@ import json
 import os
 import sys
 import time
+
+# 宏观介入缓存（2026-11-07）
+#   实测 macro_intervention() 单次要 40.3s（Tavily 新闻 + LLM），
+#   fetch_ff_week() 7.4s。低频盘每 5 分钟一轮，一天 288 轮全量重算纯属浪费，
+#   是首 tick 耗时长的主因。宏观判断按 30 分钟粒度刷新足够。
+_MACRO_CACHE: dict = {"ts": 0.0, "val": None}
+MACRO_CACHE_TTL_SEC = 1800
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -177,6 +184,24 @@ def _append(path: Path, rec: dict) -> None:
 
 
 def heartbeat(rec: dict) -> None:
+    # 每 tick 算一次真实的 LLM 可达性，写进心跳。
+    #   为什么（2026-10-23）：LLM 挂了交易端会静默走 factor_fallback，而心跳里
+    #   只有 order_source —— 那字段在没触发时是 None、触发时才填，人和巡检都
+    #   看不出来「LLM 已经死了几天」。这里留一个可回溯的布尔值。
+    if rec.get("llm_reachable") is None:
+        try:
+            from core import config as _qq
+            from urllib.parse import urlparse
+            import socket as _sock
+            _u = urlparse((_qq.LLM_BASE_URL or "").rstrip("/"))
+            _h = _u.hostname or "127.0.0.1"
+            _pt = _u.port or (443 if _u.scheme == "https" else 80)
+            with _sock.create_connection((_h, _pt), timeout=2):
+                pass
+            rec["llm_reachable"] = bool(_qq.has_llm())
+        except Exception as e:  # noqa: BLE001
+            rec["llm_reachable"] = False
+            rec["llm_unreachable_why"] = f"{type(e).__name__}: {e}"[:80]
     _append(_P()["heartbeat"], rec)
 
 
@@ -627,7 +652,17 @@ def tick(factor: str = "mom250", equity: float = 1000.0, quantile: float = 0.2,
     if use_llm and use_macro:
         try:
             from core.macro_watch import macro_intervention
-            mv = macro_intervention(today)
+            # 变量名不能叫 _now：模块级有 _now() 时间戳函数，同名局部变量会让
+            # tick() 开头 rec={"ts": _now()} 触发 UnboundLocalError（2026-11-07 实测）。
+            macro_ts = time.time()
+            if (macro_ts - _MACRO_CACHE["ts"] < MACRO_CACHE_TTL_SEC
+                    and _MACRO_CACHE["val"] is not None):
+                mv = _MACRO_CACHE["val"]
+                rec["macro_cached"] = True
+            else:
+                mv = macro_intervention(today)
+                _MACRO_CACHE["ts"] = macro_ts
+                _MACRO_CACHE["val"] = mv
             rec["macro"] = {"regime": mv.get("regime"),
                             "exposure_mult": mv.get("exposure_mult"),
                             "reason": mv.get("reason"),
@@ -643,7 +678,19 @@ def tick(factor: str = "mom250", equity: float = 1000.0, quantile: float = 0.2,
     try:
         targets, used_date = compute_targets(
             spec, str(today), quantile, testnet=testnet, neutralize=neutralize,
-            max_legs=max_legs, equity=equity)
+            max_legs=max_legs, equity=equity,
+            # hold 只用于「资金费率每期成本」的折算：hold=20 与库内低频因子
+            # 的调仓节奏一致（--min-rebalance-interval-min 240 分钟/4h 只是
+            # 触发节流，不等于持仓期）。
+            hold=20)
+        # 资金费率净成本记账（不改仓位）：回测不含永续资金费，实盘确实在付。
+        # 实测中性情形两腿合计年化 7.67%，这个数不显示出来，净收益永远对不上。
+        try:
+            from core import bridge_us_binance as _bb
+            if _bb.LAST_FUNDING_VIEW:
+                rec["funding_cost"] = _bb.LAST_FUNDING_VIEW
+        except Exception:  # noqa: BLE001
+            pass
         # 应用宏观敞口系数（risk_off → 缩小所有目标权重）
         if macro_mult != 1.0 and targets:
             for t in targets:
@@ -743,15 +790,35 @@ def tick(factor: str = "mom250", equity: float = 1000.0, quantile: float = 0.2,
     # --- 3) 拉价格（公开，无需 key） ---
     client = BinanceExec("x", "x", testnet=testnet)
     prices: dict[str, float] = {}
-    for t in targets:
+    # 2026-10-24 修复：原来只给 targets 拉价，目标外的持仓腿拿不到价格，
+    # build_orders 里 `if not px: continue` 会连平仓单一起跳过 →
+    # 残留腿永远清不掉（实测 GOOGLUSDT 就是这样卡住的）。
+    # 现在把当前持仓里的标的也一并拉价，保证平仓路径有价可用。
+    _price_syms = {t.binance_symbol for t in targets}
+    try:
+        _bk_pre = get_book()
+        if _bk_pre:
+            from core.book import load_book_positions as _lbp
+            _price_syms |= {s for s, q in (_lbp(_bk_pre) or {}).items() if abs(float(q or 0)) > 1e-9}
+        else:
+            from core.bridge_us_binance import load_positions_from_exchange as _lpe
+            _price_syms |= {s for s, q in (_lpe(testnet=testnet) or {}).items()
+                            if abs(float(q or 0)) > 1e-9}
+    except Exception:  # noqa: BLE001
+        pass
+    for sym in sorted(_price_syms):
         try:
-            tk = client.ticker(t.binance_symbol)
+            tk = client.ticker(sym)
             lp = tk.get("lastPrice")
             if lp is not None:
-                prices[t.binance_symbol] = float(lp)
+                prices[sym] = float(lp)
         except Exception:  # noqa: BLE001
             pass
     rec["n_prices"] = len(prices)
+    # 目标外仍有仓、却拿不到价格的腿 —— 必须先让人知道，否则会静默卡住
+    _nopx = [s for s in _price_syms if s not in prices]
+    if _nopx:
+        rec["prices_missing"] = _nopx
 
     # --- 4) 读持仓 + 算 delta ---
     # 账本语义：非默认盘用【本盘自有持仓账】算 delta（只认自己发过的单），
@@ -793,18 +860,20 @@ def tick(factor: str = "mom250", equity: float = 1000.0, quantile: float = 0.2,
     rec["orders"] = [o.__dict__ for o in orders]
 
     # --- 4b) 未实现盈亏（用于风控触发）---
-    #   注意：account_summary 是签名接口，必须用 from_env（带真实 key）的客户端。
-    #   用占位 client（上面的 x/x）会 -2014 API-key format invalid，导致 unrealized 恒为 0，
-    #   从而使 drawdown_alert 触发永远失效。这里单独建带凭据的客户端。
-    unrealized = 0.0
+    #   口径：只算【本盘自有持仓】的浮盈，绝不取账户合计。
+    #   历史 bug（2026-10-23 修）：这里原读 account_summary()["totalUnrealizedProfit"]，
+    #   而单账户跑多盘，交易所里是合计持仓 → 别盘的仓、以及台账外的历史老仓
+    #   全被算进本盘，导致低频盘推送的 -2.1252 实际是全账户数，与共振盘重复计量。
+    #   现在统一走 book_unrealized()：按本盘台账切片，逐标的取 positionRisk。
+    from core.book import book_unrealized
     try:
-        from core.binance_exec import BinanceExec
-        acct_client = BinanceExec.from_env(testnet=testnet)
-        acct = acct_client.account_summary()
-        unrealized = float(acct.get("totalUnrealizedProfit", 0) or 0)
+        unrealized, _pnl_src = book_unrealized(
+            _bk or None, cur, prices, testnet=testnet)
+        rec["pnl_source"] = _pnl_src
     except Exception as e:  # noqa: BLE001
+        unrealized = 0.0
         rec["account_error"] = str(e)
-    rec["unrealized_pnl"] = unrealized
+    rec["unrealized_pnl"] = round(unrealized, 6)
 
     # --- 5) 触发引擎 ---
     # 更新滚动价格历史（供 price_anomaly 使用），并读历史传给触发引擎
@@ -1068,10 +1137,17 @@ def tick(factor: str = "mom250", equity: float = 1000.0, quantile: float = 0.2,
                     orders = derisk
                     guard["proceed"] = True       # 降险单必须能发出去
                     guard["risk_reducing"] = True
+                    # 目标口径与 force_derisk 保持一致：上限取「仓位上限」与
+                    # 「当前敞口」的较小者，否则低仓位账本永远算不出要减多少。
+                    _cur_gross = sum(abs(q) * prices[s] for s, q in cur.items()
+                                     if prices.get(s) and prices[s] > 0)
                     guard["active_derisk"] = {
                         "dd_pct": round(dd_pct, 4),
                         "n_orders": len(derisk),
-                        "target_gross": round(gross_cap * equity * (1 - min(dd_pct, 0.95)), 2),
+                        "cur_gross": round(_cur_gross, 2),
+                        "target_gross": round(
+                            min(gross_cap * equity, _cur_gross)
+                            * (1 - min(dd_pct, 0.95)), 2),
                     }
                     guard["blocks"] = [b for b in guard["blocks"]
                                        if not b.startswith("max_drawdown_breaker")]
@@ -1145,9 +1221,21 @@ def tick(factor: str = "mom250", equity: float = 1000.0, quantile: float = 0.2,
 
     dry = not live
     try:
+        # 双向持仓模式下本盘固定占一个方向腿，避免与别的盘互相平仓（见 book.book_position_side）
+        # 台账记录真实生效值：单向账户返回 BOTH，不再写假的 SHORT（2026-11-05 修复）
+        from core.book import book_position_side
+        try:
+            from core.binance_exec import BinanceExec as _BE
+            _pc = _BE.from_env(testnet=testnet, book=_bk or None)
+            _pc.ping()
+        except Exception:  # noqa: BLE001  查不到就退回映射值，不阻断交易
+            _pc = None
+        _pside = book_position_side(_bk, client=_pc)
+        rec["position_side"] = _pside
         results = execute_orders(
             orders, testnet=testnet, leverage=leverage,
-            max_notional=max_notional, dry=dry)
+            max_notional=max_notional, dry=dry, position_side=_pside,
+            book=_bk)
         rec["results"] = results
         sent = [r for r in results if r.get("status") == "sent"]
         rec["n_sent"] = len(sent)

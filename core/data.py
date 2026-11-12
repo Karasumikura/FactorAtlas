@@ -53,7 +53,17 @@ def build_panel(force: bool = False, prefer_long: bool = True,
     market="us"  -> Alpaca 长历史（data/hist）
     market="ashare" -> A股（data/ashare 或 data/ashare_<index>，腾讯后复权）
       index: None/"000300"=沪深300, "000905"=中证500, "000852"=中证1000
+    market="crypto" -> 币安 USDT-M 永续主流币（data/crypto，见 data/crypto.py）
+      标的池：主流币白名单 ∧ 上市≥4年 ∧ 24h成交额≥5000万
     """
+    if market == "crypto":
+        from data import crypto
+        p = crypto.load_panel()
+        if p is None:
+            raise RuntimeError(
+                "加密面板不存在，请先运行：venv/bin/python -c "
+                "\"from data import crypto; crypto.build_panel(force=True)\"")
+        return p
     if market == "ashare":
         from data import ashare
         p = ashare.load_panel(index)

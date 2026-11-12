@@ -22,8 +22,15 @@ def _prep(factor: pd.DataFrame, fwd: pd.DataFrame, mask: pd.DataFrame | None):
     return f.where(valid), r.where(valid)
 
 
+# 逐日横截面最少标的数。20 是给美股（数百只）定的门槛；crypto 池只有 17 只，
+# 且每日可交易数中位仅 9 —— 用 20 会让 IC 序列空到 0 条，整个挖掘静默返回
+# 「全部 IC=0 / 幸存 0」，看起来像「没找到 alpha」，实际是门槛把样本全滤掉了。
+MIN_XSEC_NAMES = 8
+
+
 def rank_ic_fast(factor: pd.DataFrame, fwd: pd.DataFrame,
-                 mask: pd.DataFrame | None = None) -> pd.Series:
+                 mask: pd.DataFrame | None = None,
+                 min_names: int = MIN_XSEC_NAMES) -> pd.Series:
     """向量化逐日 Spearman IC。"""
     f, r = _prep(factor, fwd, mask)
     fr = f.rank(axis=1)
@@ -36,24 +43,43 @@ def rank_ic_fast(factor: pd.DataFrame, fwd: pd.DataFrame,
     ic = num / den.replace(0, np.nan)
     # 样本数门槛
     n_ok = (f.notna() & r.notna()).sum(axis=1)
-    ic = ic.where(n_ok >= 20)
+    ic = ic.where(n_ok >= int(min_names))
     return ic.dropna()
+
+
+def _effective_groups(f: pd.DataFrame, n_groups: int) -> int:
+    """按横截面宽度收窄分组数，保证每组仍有 ≥4 只。
+
+    2026-11-01：crypto 池只有 17 只（每日 16~17 只可交易），而分层闸写死
+    ``n >= n_groups*4 = 20``，于是每个候选的多空收益都是空序列 →
+    ``oos_ls_sharpe=NaN``，通道每轮 FDR 过 200+ 条却永远 0 幸存。
+    这里按「每日可用标的中位数」决定组数：17 只 → 4 组（门槛 16），
+    美股 600+ 只 → 仍是 5 组（门槛 20），美股结果逐值不变。
+
+    注意：宽度取自 **fwd 面板**（宇宙宽度），不是因子覆盖数。否则一个只覆盖
+    十几只美股的低频因子会跟着被降组，悄悄改变美股既有口径。
+    """
+    n_med = f.notna().sum(axis=1).median()
+    if not np.isfinite(n_med) or n_med <= 0:
+        return n_groups
+    return int(min(n_groups, max(2, n_med // 4)))
 
 
 def _layer_masks(factor: pd.DataFrame, fwd: pd.DataFrame, n_groups: int = 5,
                  mask: pd.DataFrame | None = None):
     """对齐 + 分层，返回 (f, r, top, bot, valid, long_ret, short_ret, gross)。"""
     f, r = _prep(factor, fwd, mask)
+    g = _effective_groups(fwd, n_groups)
     # 逐日分位（基于排名）
     fr = f.rank(axis=1, method="first")
     n = f.notna().sum(axis=1)
-    # 每组大小
-    valid = n >= n_groups * 4
+    # 每组至少 4 只才认为当天可分层
+    valid = n >= g * 4
     # 计算分位组：quantile of rank
     q = fr.div(n, axis=0)  # [0,1]
-    group = np.floor(q * n_groups).clip(upper=n_groups - 1)
+    group = np.floor(q * g).clip(upper=g - 1)
 
-    top = group == (n_groups - 1)
+    top = group == (g - 1)
     bot = group == 0
     # 多头/空头等权收益
     r_filled = r

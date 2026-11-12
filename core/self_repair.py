@@ -117,7 +117,10 @@ def diagnose(log_glob: str = "runs/loop_*/round_*/mine*.log",
             })
 
     # 2) 服务不在运行
-    for svc in ("quant-trader", "quant-miner", "quant-trader-resonance", "y2a-auto"):
+    # 不含 quant-miner：挖掘 2026-11-05 迁到深圳机，本地 systemctl 查不到它。
+    # 远端状态由 ops_watch 的 _sz_miner_state() 盯（agent 自愈够不着另一台机器，
+    # 硬要"修"只会去改本地那份没人执行的代码）。
+    for svc in ("quant-trader", "quant-trader-resonance", "y2a-auto"):
         try:
             r = subprocess.run(["systemctl", "is-active", svc],
                                capture_output=True, text=True, timeout=10)

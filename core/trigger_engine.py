@@ -137,15 +137,20 @@ def check_triggers(
             hist = price_history.get(sym, [])
             if len(hist) < max(5, lb // 2):
                 continue
-            window = hist[-lb:]
+            window = [float(x) for x in hist[-lb:]]
             mu = sum(window) / len(window)
             var = sum((x - mu) ** 2 for x in window) / len(window)
             sd = var ** 0.5
-            if sd > 1e-9:
-                z = (px - mu) / sd
-                if abs(z) >= q["price_zscore"]:
-                    res.add("price_anomaly",
-                            sym=sym, px=px, mean=round(mu, 2), z=round(z, 2))
+            # 2026-10-28：零波动（或 nan）窗口直接跳过。
+            # Demo 存在僵尸标的（XYZUSDT 恒 2535），它们进了滚动历史后，
+            # 旧写法 `if sd > 1e-9:` 里嵌套的计算一旦 sd 为 0/nan 就会把
+            # 整个 tick 拖崩（落地成 signal_error），交易端停摆。
+            if not (sd > 1e-9):
+                continue
+            z = (px - mu) / sd
+            if abs(z) >= q["price_zscore"]:
+                res.add("price_anomaly",
+                        sym=sym, px=px, mean=round(mu, 2), z=round(z, 2))
 
     # --- 3) 风控触发：浮动亏损 ---
     if equity > 0:

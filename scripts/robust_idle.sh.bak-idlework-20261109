@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# 冷却期体检：挖掘/晋升不在跑时才执行，把空闲 CPU 拿来做评估（不是搜索，不涨试验数）。
+# 覆盖美股 + 加密两个面板：同一个因子在另一个universe里还成不成立，是最便宜的正交性检验。
+set -uo pipefail
+cd /opt/quant-lab || exit 0
+if pgrep -f "core\.mine|core\.promote" >/dev/null 2>&1; then
+  echo "[$(date "+%F %T")] 挖掘中，跳过"; exit 0
+fi
+for MKT in us crypto; do
+  echo "[$(date "+%F %T")] 空闲，开始体检 market=$MKT"
+  nice -n 10 timeout 900 ./venv/bin/python scripts/robustness_scan.py --market $MKT \
+    >> runs/robust_scan.log 2>&1
+  echo "[$(date "+%F %T")] market=$MKT 结束 exit=$?"
+done
+
+# 2026-11-09：五维评估（AlphaEval, KDD 2026, MIT）——同样只做评估、不新增候选，
+# 不抬 overfit_guard 的累计试验数 N。放在体检之后串行跑，避免两路同时吃面板内存。
+if ! pgrep -f "core\.mine|core\.promote" >/dev/null 2>&1; then
+  echo "[$(date "+%F %T")] 空闲，开始五维评估 market=us"
+  nice -n 10 timeout 900 ./venv/bin/python scripts/alpha_eval5_scan.py --market us \
+    >> runs/alpha_eval5.log 2>&1
+  echo "[$(date "+%F %T")] 五维评估结束 exit=$?"
+else
+  echo "[$(date "+%F %T")] 挖掘中，跳过五维评估"
+fi

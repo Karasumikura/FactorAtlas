@@ -38,6 +38,24 @@ FAPI_DEMO = "https://testnet.binancefuture.com"
 RECV_WINDOW = 5000  # ms
 _HTTP_TIMEOUT = 15.0
 
+# ---------------------------------------------------------------------------
+# 账本 → 账户号 映射（赛马隔离）
+# ---------------------------------------------------------------------------
+# 每个策略跑在**独立的币安 Demo 账户**上，物理隔离持仓，互不平仓。
+#   账户 1 = 主账户（BINANCE_API_KEY   / BINANCE_API_SECRET）
+#   账户 2 = 第二账户（BINANCE_API_KEY_2 / BINANCE_API_SECRET_2）
+# 想换边只改这里（或设 QUANT_BINANCE_ACCOUNT=<N> 环境变量覆盖全局默认）。
+_BOOK_ACCOUNT: dict[str, int] = {
+    "lowfreq": 1,      # 老账户：保住低频盘 8 个标的的历史持仓连续性
+    "resonance": 2,    # 新账户：干净空仓，共振盘 30min 一轮高频调仓，迁过去影响最小
+}
+
+
+def normalize_book(book: str | None) -> str:
+    """账本名规范化（空 → lowfreq，与 book.py 的默认账本语义一致）。"""
+    b = (book or "").strip().lower()
+    return b or "lowfreq"
+
 # 常见错误码 → 可读含义（调试用）
 ERR_HINT = {
     -1021: "时间戳超出 recvWindow：服务器时钟漂移，检查 NTP 同步或调大 RECV_WINDOW",
@@ -73,9 +91,41 @@ class BinanceExec:
 
     # -- 构造 ----------------------------------------------------------------
     @classmethod
-    def from_env(cls, testnet: bool = True) -> "BinanceExec":
-        # 通过 core.config 自动加载 .env（BINANCE_API_KEY / BINANCE_API_SECRET）
+    def from_env(cls, testnet: bool = True, book: str | None = None,
+                 account: int | None = None) -> "BinanceExec":
+        """按账本/账户序号构造执行客户端。
+
+        赛马隔离（2026-10-23）
+        =====================
+        两个策略跑同一个账户时，交易所里是**同一套持仓**：A 想做多 B 想做空，
+        谁后下单谁就把对方平掉（实测 CRCLUSDT 一天内被 flip 8 次）。
+        切双向持仓（Hedge Mode）也只能让两盘各占一条腿 → 策略各废一半。
+
+        终解：**每盘一个独立币安 Demo 账户**，物理隔离，完整多空互不影响。
+
+        选择顺序：
+          1. 显式 account=N → 用 BINANCE_API_KEY_<N> / BINANCE_API_SECRET_<N>
+          2. book 命中 _BOOK_ACCOUNT 映射 → 用映射到的账户
+          3. 环境变量 QUANT_BINANCE_ACCOUNT=<N>
+          4. 兜底用主账户（BINANCE_API_KEY / BINANCE_API_SECRET）
+        """
         from core import config  # noqa: F401  触发 load_dotenv
+        n = account
+        if n is None and book:
+            n = _BOOK_ACCOUNT.get(normalize_book(book))
+        if n is None:
+            envn = (os.environ.get("QUANT_BINANCE_ACCOUNT") or "").strip()
+            n = int(envn) if envn.isdigit() else None
+
+        if n and n != 1:
+            k = os.environ.get(f"BINANCE_API_KEY_{n}", "")
+            s = os.environ.get(f"BINANCE_API_SECRET_{n}", "")
+            if not k or not s:
+                raise RuntimeError(
+                    f"账本 {book!r} 需要账户 {n}，但缺少 "
+                    f"BINANCE_API_KEY_{n} / BINANCE_API_SECRET_{n}")
+            return cls(k, s, testnet=testnet)
+
         k = os.environ.get("BINANCE_API_KEY", "")
         s = os.environ.get("BINANCE_API_SECRET", "")
         if not k or not s:
@@ -208,7 +258,15 @@ class BinanceExec:
                     price: float | None = None, stop_price: float | None = None,
                     time_in_force: str | None = None, reduce_only: bool | None = None,
                     close_position: bool | None = None,
-                    client_order_id: str | None = None) -> dict:
+                    client_order_id: str | None = None,
+                    position_side: str | None = None) -> dict:
+        """下单。
+
+        position_side: 双向持仓模式（Hedge Mode）下必填 LONG/SHORT；单向模式下
+        调用方传 None 即可（自动用 BOTH）。
+        双向模式下**不能**再传 reduceOnly（币安会 -4061 拒绝），平仓要靠
+        positionSide + 反向 side 表达。
+        """
         filt = self.symbol_filters(symbol)
         if price is not None:
             price = self.snap_price(price, filt["tick"], int(filt["pricePrec"]))
@@ -221,26 +279,64 @@ class BinanceExec:
         if order_type == "LIMIT" and not time_in_force:
             time_in_force = "GTC"
 
-        params = {k: v for k, v in {
+        dual = self.dual_position_mode()
+        if position_side is None:
+            position_side = "BOTH"
+        position_side = position_side.upper()
+        if dual and position_side == "BOTH":
+            raise ValueError(
+                f"账户是双向持仓模式，必须指定 positionSide=LONG/SHORT（{symbol}）")
+        if not dual:
+            # 单向模式只认 BOTH；传 LONG/SHORT 会被 -4061 拒
+            position_side = "BOTH"
+
+        # 双向模式下 reduceOnly 与 positionSide 互斥
+        if dual:
+            reduce_only = None
+
+        base = {
             "symbol": symbol, "side": side, "type": order_type,
             "quantity": quantity, "price": price, "stopPrice": stop_price,
             "timeInForce": time_in_force,
             "reduceOnly": str(reduce_only).lower() if reduce_only is not None else None,
             "closePosition": str(close_position).lower() if close_position is not None else None,
             "newClientOrderId": client_order_id,
-        }.items() if v is not None}
+            "positionSide": position_side,
+        }
 
         if order_type in self._ALGO_TYPES:
             algo = {k: v for k, v in {
                 "algoType": "CONDITIONAL", "symbol": symbol, "side": side,
                 "type": order_type, "quantity": quantity, "price": price,
                 "triggerPrice": stop_price, "timeInForce": time_in_force,
-                "reduceOnly": str(reduce_only).lower() if reduce_only is not None else None,
-                "closePosition": str(close_position).lower() if close_position is not None else None,
+                "reduceOnly": base["reduceOnly"],
+                "closePosition": base["closePosition"],
+                "positionSide": position_side,
                 "clientAlgoId": client_order_id,
             }.items() if v is not None}
             return self.signed_post("/fapi/v1/algoOrder", **algo)
+        params = {k: v for k, v in base.items() if v is not None}
         return self.signed_post("/fapi/v1/order", **params)
+
+    def dual_position_mode(self) -> bool:
+        """账户是否为双向持仓模式（Hedge Mode）。结果按客户端实例缓存。"""
+        cached = getattr(self, "_dual_cache", None)
+        if cached is not None:
+            return cached
+        try:
+            r = self.signed_get("/fapi/v1/positionSide/dual")
+            d = bool(r.get("dualSidePosition"))
+        except Exception:  # noqa: BLE001
+            d = False
+        self._dual_cache = d
+        return d
+
+    def set_dual_position_mode(self, dual: bool) -> dict:
+        """切换持仓模式。**账户有持仓时币安会拒绝**（需先全部平仓）。"""
+        r = self.signed_post("/fapi/v1/positionSide/dual",
+                             dualSidePosition="true" if dual else "false")
+        self._dual_cache = dual
+        return r
 
     def set_leverage(self, symbol: str, leverage: int) -> dict:
         return self.signed_post("/fapi/v1/leverage", symbol=symbol, leverage=leverage)

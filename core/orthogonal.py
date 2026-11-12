@@ -85,5 +85,19 @@ ASHARE_CLUSTER = [
 ]
 
 
+# 加密永续的主导簇：动量（短中期）+ 波动率。币的趋势比美股更"暴力"，
+# 且 24/7 交易、无财报断点，短周期动量(20/60)比长周期(250)更有效。
+CRYPTO_CLUSTER = [
+    {"op": "mom", "params": {"n": 20}, "direction": 1},
+    {"op": "mom", "params": {"n": 60}, "direction": 1},
+    {"op": "volatility_ratio", "params": {"n": 20}, "direction": 1},
+    {"op": "trend_strength", "params": {"n": 60}, "direction": 1},
+]
+
+
 def cluster_for(market: str) -> list[dict]:
-    return ASHARE_CLUSTER if market == "ashare" else TREND_CLUSTER
+    if market == "ashare":
+        return ASHARE_CLUSTER
+    if market == "crypto":
+        return CRYPTO_CLUSTER
+    return TREND_CLUSTER

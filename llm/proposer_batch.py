@@ -12,7 +12,7 @@ from factors.engine import OP_DOC
 from llm.client import chat, extract_json
 
 # LLM 瞬时并发硬上限，避免调用方传入过大的 concurrency。
-MAX_LLM_CONCURRENCY = max(1, int(os.environ.get("QUANT_MAX_LLM_CONCURRENCY", "4")))
+MAX_LLM_CONCURRENCY = max(1, int(os.environ.get("QUANT_MAX_LLM_CONCURRENCY", "1")))
 
 
 SYSTEM = """你是顶尖量化研究员，专精横截面选股因子。任务是提出有经济学逻辑支撑的候选因子。
@@ -68,7 +68,8 @@ def _one_call(seed: str, n: int, tried_names: list[str], temperature: float,
 请提出 {n} 个因子，只输出 JSON 数组。"""
     try:
         raw = chat([{"role": "system", "content": SYSTEM.replace("{n}", str(n))},
-                    {"role": "user", "content": user}], temperature=temperature)
+                    {"role": "user", "content": user}], temperature=temperature,
+                   retries=1)
         data = extract_json(raw)
         if isinstance(data, dict):
             data = [data]
@@ -135,6 +136,39 @@ def _tried_key(spec: dict) -> str:
     return json.dumps({"op": spec.get("op"), "params": params}, sort_keys=True)
 
 
+def _library_hint() -> str:
+    """把「现有因子库」写进提示词。
+
+    为什么需要：库里的 11 个因子由 vol / mom / turnover 三族占了绝大多数，
+    而提案端此前只知道自己这批提过什么（tried_names），完全看不见**已经晋升
+    的库**——于是每轮都在同一片地里反复翻土，挖出来的自然是同族变体。
+
+    这里显式给出族分布 + 已入库名单，并要求新提案优先走未见过的算子族。
+    不改任何判定逻辑，纯提示词增强；LLM 不遵守也只是回到原状，不会更差。
+    """
+    try:
+        import json as _json
+        from collections import Counter
+        from pathlib import Path
+
+        lib = _json.loads(Path("/opt/quant-lab/data/factor_library.json").read_text())
+        facs = list((lib.get("factors") or {}).values())
+        if not facs:
+            return ""
+        ops = Counter(((f.get("spec") or {}).get("op") or "?") for f in facs)
+        fam = "、".join(f"{o}×{c}" for o, c in ops.most_common(6))
+        names = "、".join(str(f.get("name")) for f in facs[:20])
+        return ("\n\n【现有因子库（这些已经晋升在跑，不要重复提同类）】\n"
+                f"族分布：{fam}\n"
+                f"已入库：{names}\n"
+                "要求：1) 优先提出上面**没出现过的算子族**；"
+                "2) 若必须用已有族，必须给出正交理由（不同窗口 / 不同方向 / 不同经济机制），"
+                "且同族提案不超过本批的 1/4；"
+                "3) 已经被剪掉的弱族（如纯 volume_price_corr、窄窗口 turnover_chg）不要再堆。")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def propose_batch(total: int = 120, concurrency: int = 12, per_call: int = 6,
                   tried: list[dict] | None = None, temperature: float = 0.9,
                   verbose: bool = True, hold: int = 1) -> list[dict]:
@@ -163,10 +197,11 @@ def propose_batch(total: int = 120, concurrency: int = 12, per_call: int = 6,
     avoid = ""
     if used_n:
         used_list = sorted(used_n)
-        show = ",".join(str(x) for x in used_list[:24])
+        show = ", ".join(str(x) for x in used_list[:24])
         avoid = (f"\n\n【参数避让】以下窗口长度 n 已被穷尽，**不要再用**：{show}\n"
                  f"请改用未出现过的整数窗口（例如 7,13,18,23,28,33,45,55,75,90,100,150,180 等，"
                  f"或按你的逻辑另选），确保 n 不在上述列表内。")
+    avoid += _library_hint()
 
     global _CALL_HOLD
     _CALL_HOLD = hold

@@ -1,25 +1,5 @@
 {
   "factors": {
-    "{\"direction\": 1, \"op\": \"volatility_ratio\", \"params\": {\"n\": 15}}": {
-      "name": "intraday_amplitude_risk_flip",
-      "spec": {
-        "name": "intraday_amplitude_risk_flip",
-        "op": "volatility_ratio",
-        "params": {
-          "n": 15
-        },
-        "direction": 1,
-        "rationale": "日内振幅均值高代表信息不对称与流动性提供者风险溢价高，微观结构噪音大的股票未来收益被折价。",
-        "source": "llm_batch"
-      },
-      "n_sessions": 3,
-      "oos_median": 0.7328,
-      "dsr_best": 0.9828,
-      "pbo_best": 0.3286,
-      "lf_net_median": 0.55,
-      "first_promoted": "2026-10-16T22:49:29.544421+00:00",
-      "last_seen": "2026-10-17T03:55:48.545260+00:00"
-    },
     "{\"direction\": 1, \"op\": \"mom\", \"params\": {\"n\": 250, \"skip\": 20}}": {
       "name": "mom_n250_skip20",
       "spec": {
@@ -33,65 +13,16 @@
         "rationale": "系统扫描 mom{'n': 250, 'skip': 20} dir=1",
         "source": "sweep"
       },
-      "n_sessions": 24,
-      "oos_median": 0.4674,
-      "dsr_best": 0.9512,
-      "pbo_best": 0.1429,
-      "lf_net_median": 0.213,
-      "first_promoted": "2026-10-16T15:27:52.161390+00:00",
-      "last_seen": "2026-10-17T03:55:48.545381+00:00"
-    },
-    "{\"direction\": 1, \"expr\": {\"left\": {\"op\": \"trend_strength\", \"params\": {\"n\": 120}}, \"op\": \"div\", \"right\": {\"op\": \"vol\", \"params\": {\"n\": 60}}}}": {
-      "name": "trend_x_lowvol_d1",
-      "spec": {
-        "name": "trend_x_lowvol_d1",
-        "kind": "combo",
-        "expr": {
-          "op": "div",
-          "left": {
-            "op": "trend_strength",
-            "params": {
-              "n": 120
-            }
-          },
-          "right": {
-            "op": "vol",
-            "params": {
-              "n": 60
-            }
-          }
-        },
-        "direction": 1,
-        "rationale": "趋势强度除以波动，稳健趋势",
-        "source": "classic_combo"
-      },
-      "n_sessions": 23,
-      "oos_median": 0.3588,
-      "dsr_best": 0.973,
-      "pbo_best": 0.1429,
-      "lf_net_median": 0.365,
-      "first_promoted": "2026-10-16T15:27:52.161422+00:00",
-      "last_seen": "2026-10-17T03:55:48.545392+00:00"
-    },
-    "{\"direction\": 1, \"op\": \"skew\", \"params\": {\"n\": 33}}": {
-      "name": "skew_tail_risk_33_flip",
-      "spec": {
-        "name": "skew_tail_risk_33_flip",
-        "op": "skew",
-        "params": {
-          "n": 33
-        },
-        "direction": 1,
-        "rationale": "正偏度高的股票多为彩票型标的，尾部风险溢价为负，20日持有下负偏度（稳健）股票风险调整收益更佳。",
-        "source": "llm_batch"
-      },
-      "n_sessions": 2,
-      "oos_median": 6.7716,
-      "dsr_best": 1.0,
+      "n_sessions": 14,
+      "n_distinct_oos": 17,
+      "oos_median": 3.754,
+      "icir_median": 0.1701,
+      "oos_ic_median": 0.0186,
+      "dsr_best": 0.9998,
       "pbo_best": 0.0,
       "lf_net_median": null,
-      "first_promoted": "2026-10-18T21:29:09.133044+00:00",
-      "last_seen": "2026-10-18T21:29:09.134044+00:00"
+      "first_promoted": "2026-10-16T15:27:52.161390+00:00",
+      "last_seen": "2026-11-12T10:18:23.800784+00:00"
     },
     "{\"direction\": 1, \"op\": \"turnover_chg\", \"params\": {\"n\": 120}}": {
       "name": "turnover_chg_n120",
@@ -105,146 +36,16 @@
         "rationale": "系统扫描 turnover_chg{'n': 120} dir=1",
         "source": "sweep"
       },
-      "n_sessions": 2,
-      "oos_median": 5.0539,
+      "n_sessions": 16,
+      "n_distinct_oos": 19,
+      "oos_median": 5.1243,
+      "icir_median": 0.1548,
+      "oos_ic_median": 0.0344,
       "dsr_best": 1.0,
       "pbo_best": 0.0,
       "lf_net_median": null,
       "first_promoted": "2026-10-18T21:29:09.135590+00:00",
-      "last_seen": "2026-10-18T21:29:09.135599+00:00"
-    },
-    "{\"direction\": 1, \"op\": \"volume_price_corr\", \"params\": {\"n\": 60}}": {
-      "name": "volume_price_corr_n60",
-      "spec": {
-        "name": "volume_price_corr_n60",
-        "op": "volume_price_corr",
-        "params": {
-          "n": 60
-        },
-        "direction": 1,
-        "rationale": "系统扫描 volume_price_corr{'n': 60} dir=1",
-        "source": "sweep"
-      },
-      "n_sessions": 2,
-      "oos_median": 4.3789,
-      "dsr_best": 1.0,
-      "pbo_best": 0.0,
-      "lf_net_median": null,
-      "first_promoted": "2026-10-18T21:29:09.135607+00:00",
-      "last_seen": "2026-10-18T21:29:09.135610+00:00"
-    },
-    "{\"direction\": -1, \"op\": \"news_attention\", \"params\": {\"n\": 3}}": {
-      "name": "news_attention_n3",
-      "spec": {
-        "name": "news_attention_n3",
-        "op": "news_attention",
-        "params": {
-          "n": 3
-        },
-        "direction": -1,
-        "rationale": "系统扫描 news_attention{'n': 3} dir=-1",
-        "source": "sweep"
-      },
-      "n_sessions": 2,
-      "oos_median": 1.0554,
-      "dsr_best": 1.0,
-      "pbo_best": 0.0,
-      "lf_net_median": null,
-      "first_promoted": "2026-10-18T21:29:09.135634+00:00",
-      "last_seen": "2026-10-18T21:29:09.135639+00:00"
-    },
-    "{\"direction\": 1, \"op\": \"downside_days\", \"params\": {\"n\": 60}}": {
-      "name": "downside_days_n60",
-      "spec": {
-        "name": "downside_days_n60",
-        "op": "downside_days",
-        "params": {
-          "n": 60
-        },
-        "direction": 1,
-        "rationale": "系统扫描 downside_days{'n': 60} dir=1",
-        "source": "sweep"
-      },
-      "n_sessions": 2,
-      "oos_median": 0.9978,
-      "dsr_best": 1.0,
-      "pbo_best": 0.0,
-      "lf_net_median": null,
-      "first_promoted": "2026-10-18T21:29:09.135646+00:00",
-      "last_seen": "2026-10-18T21:29:09.135649+00:00"
-    },
-    "{\"direction\": -1, \"expr\": {\"left\": {\"op\": \"price_position\", \"params\": {\"n\": 120}}, \"op\": \"div\", \"right\": {\"op\": \"vol\", \"params\": {\"n\": 60}}}}": {
-      "name": "price_pos_div_vol_d-1",
-      "spec": {
-        "name": "price_pos_div_vol_d-1",
-        "kind": "combo",
-        "expr": {
-          "op": "div",
-          "left": {
-            "op": "price_position",
-            "params": {
-              "n": 120
-            }
-          },
-          "right": {
-            "op": "vol",
-            "params": {
-              "n": 60
-            }
-          }
-        },
-        "direction": -1,
-        "rationale": "相对位置除以波动",
-        "source": "classic_combo"
-      },
-      "n_sessions": 2,
-      "n_distinct_oos": 1,
-      "oos_median": 3.4095,
-      "dsr_best": 1.0,
-      "pbo_best": 0.0,
-      "lf_net_median": null,
-      "first_promoted": "2026-10-19T01:45:27.515401+00:00",
-      "last_seen": "2026-10-19T01:45:27.515445+00:00"
-    },
-    "{\"direction\": -1, \"op\": \"xbrl_log_mcap\", \"params\": {}}": {
-      "name": "xbrl_log_mcap_-1",
-      "spec": {
-        "name": "xbrl_log_mcap_-1",
-        "op": "xbrl_log_mcap",
-        "params": {},
-        "direction": -1,
-        "rationale": "系统扫描 xbrl_log_mcap{} dir=-1",
-        "source": "sweep"
-      },
-      "n_sessions": 2,
-      "n_distinct_oos": 1,
-      "oos_median": 7.2878,
-      "dsr_best": 1.0,
-      "pbo_best": 0.0,
-      "lf_net_median": null,
-      "first_promoted": "2026-10-19T06:09:22.210700+00:00",
-      "last_seen": "2026-10-19T06:09:22.211301+00:00"
-    },
-    "{\"direction\": 1, \"op\": \"volume_price_corr\", \"params\": {\"n\": 120}}": {
-      "name": "volume_price_corr_n120",
-      "spec": {
-        "name": "volume_price_corr_n120",
-        "op": "volume_price_corr",
-        "params": {
-          "n": 120
-        },
-        "direction": 1,
-        "rationale": "系统扫描 volume_price_corr{'n': 120} dir=1",
-        "source": "sweep"
-      },
-      "n_sessions": 2,
-      "n_distinct_oos": 1,
-      "oos_median": 4.5356,
-      "dsr_best": 1.0,
-      "pbo_best": 0.0,
-      "lf_net_median": null,
-      "first_promoted": "2026-10-19T06:09:22.211336+00:00",
-      "last_seen": "2026-10-19T06:09:22.211342+00:00"
+      "last_seen": "2026-11-12T10:18:23.800002+00:00"
     },
     "{\"direction\": -1, \"op\": \"xbrl_gross_margin\", \"params\": {}}": {
       "name": "xbrl_gross_margin_-1",
@@ -256,84 +57,224 @@
         "rationale": "系统扫描 xbrl_gross_margin{} dir=-1",
         "source": "sweep"
       },
-      "n_sessions": 2,
-      "n_distinct_oos": 1,
-      "oos_median": 3.63,
+      "n_sessions": 10,
+      "n_distinct_oos": 9,
+      "oos_median": 2.8274,
+      "icir_median": 0.114,
+      "oos_ic_median": 0.0306,
       "dsr_best": 1.0,
       "pbo_best": 0.0,
       "lf_net_median": null,
       "first_promoted": "2026-10-19T06:09:22.211364+00:00",
-      "last_seen": "2026-10-19T06:09:22.211368+00:00"
+      "last_seen": "2026-11-12T10:18:23.801555+00:00"
     },
-    "{\"direction\": 1, \"op\": \"turnover_std\", \"params\": {\"n\": 120}}": {
-      "name": "turnover_std_n120",
+    "{\"direction\": 1, \"op\": \"downside_vol\", \"params\": {\"n\": 60}}": {
+      "name": "downside_vol_n60",
       "spec": {
-        "name": "turnover_std_n120",
-        "op": "turnover_std",
+        "name": "downside_vol_n60",
+        "op": "downside_vol",
         "params": {
-          "n": 120
+          "n": 60
         },
         "direction": 1,
-        "rationale": "系统扫描 turnover_std{'n': 120} dir=1",
+        "rationale": "系统扫描 downside_vol{'n': 60} dir=1",
         "source": "sweep"
       },
-      "n_sessions": 2,
-      "n_distinct_oos": 1,
-      "oos_median": 3.0155,
+      "n_sessions": 8,
+      "n_distinct_oos": 6,
+      "oos_median": 6.679,
+      "icir_median": 0.0701,
+      "oos_ic_median": 0.0697,
       "dsr_best": 1.0,
       "pbo_best": 0.0,
       "lf_net_median": null,
-      "first_promoted": "2026-10-19T06:09:22.211374+00:00",
-      "last_seen": "2026-10-19T06:09:22.211377+00:00"
+      "first_promoted": "2026-10-25T23:47:05.733228+00:00",
+      "last_seen": "2026-11-08T17:47:08.233175+00:00"
     },
-    "{\"direction\": 1, \"op\": \"mom\", \"params\": {\"n\": 144, \"skip\": 12}}": {
-      "name": "long_mom_skip_recent_144",
+    "{\"direction\": 1, \"op\": \"downside_vol\", \"params\": {\"n\": 20}}": {
+      "name": "downside_vol_n20",
       "spec": {
-        "name": "long_mom_skip_recent_144",
-        "op": "mom",
+        "name": "downside_vol_n20",
+        "op": "downside_vol",
         "params": {
-          "n": 144,
-          "skip": 12
+          "n": 20
         },
         "direction": 1,
-        "rationale": "较长趋势（144日）剔除近月（12日）动量，捕捉期限结构中慢趋势延续、剔除短期反转噪音的部分，20日持有可承接机构调仓惯性。",
-        "source": "llm_batch"
+        "rationale": "系统扫描 downside_vol{'n': 20} dir=1",
+        "source": "sweep"
       },
-      "n_sessions": 2,
-      "n_distinct_oos": 1,
-      "oos_median": 5.4868,
-      "dsr_best": 0.9994,
+      "n_sessions": 8,
+      "n_distinct_oos": 6,
+      "oos_median": 6.4455,
+      "icir_median": 0.067,
+      "oos_ic_median": 0.0538,
+      "dsr_best": 1.0,
       "pbo_best": 0.0,
       "lf_net_median": null,
-      "first_promoted": "2026-10-21T08:01:32.332117+00:00",
-      "last_seen": "2026-10-21T08:01:32.332837+00:00"
+      "first_promoted": "2026-10-25T23:47:05.734497+00:00",
+      "last_seen": "2026-11-08T17:47:08.234577+00:00"
+    },
+    "{\"direction\": 1, \"op\": \"upside_vol\", \"params\": {\"n\": 60}}": {
+      "name": "upside_vol_n60",
+      "spec": {
+        "name": "upside_vol_n60",
+        "op": "upside_vol",
+        "params": {
+          "n": 60
+        },
+        "direction": 1,
+        "rationale": "系统扫描 upside_vol{'n': 60} dir=1",
+        "source": "sweep"
+      },
+      "n_sessions": 8,
+      "n_distinct_oos": 6,
+      "oos_median": 6.8919,
+      "icir_median": 0.0666,
+      "oos_ic_median": 0.078,
+      "dsr_best": 1.0,
+      "pbo_best": 0.0,
+      "lf_net_median": null,
+      "first_promoted": "2026-10-27T05:04:02.829272+00:00",
+      "last_seen": "2026-11-08T17:47:08.230423+00:00"
     }
   },
-  "updated_at": "2026-10-22T17:06:16.319628+00:00",
-  "n_candidates_seen": 259,
-  "cumulative_trials": 82663,
+  "updated_at": "2026-11-12T10:18:23.801582+00:00",
+  "n_candidates_seen": 644,
+  "cumulative_trials": 94519,
   "redundancy_gate": {
-    "max_abs_corr": 0.8,
-    "max_library": 20,
-    "n_rejected_redundant": 48
+    "max_abs_corr": 0.6,
+    "max_library": 60,
+    "min_abs_icir": 0.09,
+    "n_rejected_redundant": 15,
+    "rejected_detail": [
+      {
+        "spec_id": "{\"direction\": -1, \"op\": \"downside_vol\", \"params\": {\"n\": 60}}",
+        "name": "downside_vol_n60",
+        "corr": 1.0,
+        "with": "downside_vol_n60",
+        "reason": "redundant_same_family"
+      },
+      {
+        "spec_id": "{\"direction\": 1, \"op\": \"mom\", \"params\": {\"n\": 250, \"skip\": 0}}",
+        "name": "mom_n250_skip0",
+        "corr": 0.9044,
+        "with": "mom_n250_skip20",
+        "reason": "redundant_same_family"
+      },
+      {
+        "spec_id": "{\"direction\": 1, \"op\": \"upside_vol\", \"params\": {\"n\": 120}}",
+        "name": "upside_vol_n120",
+        "corr": 0.8885,
+        "with": "upside_vol_n60",
+        "reason": "redundant_same_family"
+      },
+      {
+        "spec_id": "{\"direction\": -1, \"op\": \"ret\", \"params\": {\"n\": 60}}",
+        "name": "ret_n60",
+        "corr": 0.6152,
+        "with": "mom_n60_skip20",
+        "reason": "redundant_cross_family"
+      },
+      {
+        "spec_id": "{\"direction\": -1, \"op\": \"mom\", \"params\": {\"n\": 60, \"skip\": 0}}",
+        "name": "mom_n60_skip0",
+        "corr": 0.6152,
+        "with": "mom_n60_skip20",
+        "reason": "redundant_same_family"
+      },
+      {
+        "spec_id": "{\"direction\": 1, \"op\": \"reversal\", \"params\": {\"n\": 60}}",
+        "name": "reversal_n60",
+        "corr": 0.6152,
+        "with": "mom_n60_skip20",
+        "reason": "redundant_cross_family"
+      },
+      {
+        "spec_id": "{\"direction\": -1, \"op\": \"price_position\", \"params\": {\"n\": 250}}",
+        "name": "price_position_n250",
+        "corr": 0.641,
+        "with": "mom_n250_skip20",
+        "reason": "redundant_cross_family"
+      },
+      {
+        "spec_id": "{\"direction\": 1, \"op\": \"hl_range\", \"params\": {\"n\": 90}}",
+        "name": "hl_range_spread_proxy_90",
+        "corr": 0.7936,
+        "with": "upside_vol_n60",
+        "reason": "redundant_cross_family"
+      },
+      {
+        "spec_id": "{\"direction\": 1, \"op\": \"vol\", \"params\": {\"n\": 90}}",
+        "name": "low_idio_vol_90_flip",
+        "corr": 0.8474,
+        "with": "upside_vol_n60",
+        "reason": "redundant_cross_family"
+      },
+      {
+        "spec_id": "{\"direction\": 1, \"op\": \"trend_strength\", \"params\": {\"n\": 100}}",
+        "name": "trend_strength_100d",
+        "corr": 0.7485,
+        "with": "mom_n250_skip20",
+        "reason": "redundant_cross_family"
+      },
+      {
+        "spec_id": "{\"direction\": 1, \"op\": \"hl_range\", \"params\": {\"n\": 80}}",
+        "name": "intraday_amplitude_noise_n80_flip",
+        "corr": 0.7954,
+        "with": "upside_vol_n60",
+        "reason": "redundant_cross_family"
+      },
+      {
+        "spec_id": "{\"direction\": 1, \"op\": \"vwap_dev\", \"params\": {\"n\": 20}}",
+        "name": "vwap_dev_n20",
+        "corr": 0.8301,
+        "with": "vwap_dev_n10",
+        "reason": "redundant_same_family"
+      },
+      {
+        "spec_id": "{\"direction\": -1, \"op\": \"price_position\", \"params\": {\"n\": 200}}",
+        "name": "range_position_long_200_flip",
+        "corr": 0.7519,
+        "with": "price_position_n60",
+        "reason": "redundant_same_family"
+      },
+      {
+        "spec_id": "{\"direction\": 1, \"op\": \"vwap_dev\", \"params\": {\"n\": 5}}",
+        "name": "vwap_dev_n5",
+        "corr": 0.8165,
+        "with": "vwap_dev_n10",
+        "reason": "redundant_same_family"
+      },
+      {
+        "spec_id": "{\"direction\": 1, \"op\": \"vwap_dev\", \"params\": {\"n\": 3}}",
+        "name": "vwap_dev_n3",
+        "corr": 0.629,
+        "with": "vwap_dev_n10",
+        "reason": "redundant_same_family"
+      }
+    ]
   },
   "trial_accounting": {
-    "raw_trials": 82663,
-    "effective_trials": 114,
+    "raw_trials": 94519,
+    "effective_trials": 185,
     "families": {
-      "vol": 44,
-      "volatility_ratio": 21,
-      "hl_range": 20,
-      "mom": 16,
-      "turnover": 15,
-      "reversal": 15,
-      "skew": 9,
-      "price_position": 9,
-      "gap": 9,
-      "volume_ratio": 9,
-      "trend_strength": 7,
-      "turnover_std": 6
+      "mom": 55,
+      "hl_range": 49,
+      "volatility_ratio": 41,
+      "turnover": 38,
+      "vol": 35,
+      "price_position": 31,
+      "rank_mul": 28,
+      "vwap_dev": 27,
+      "rank_sub": 26,
+      "max_drawdown": 25,
+      "news_tone_dispersion": 25,
+      "volume_ratio": 20
     },
-    "n_families": 36
-  }
+    "n_families": 47
+  },
+  "pruned_at": "2026-11-09T03:24:24+0800",
+  "prune_rule": "IC>=0.01 & sessions>=5 & |OOS|>=0.6 & (ICIR>=0.09 or IC>=0.05)",
+  "robust_checked_at": "2026-11-09T03:36:38+0800",
+  "robust_rule": "sign_consistency==1.0 & across-config IC>=0.01"
 }

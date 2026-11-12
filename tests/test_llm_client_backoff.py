@@ -1,0 +1,107 @@
+"""llm/client 的 429 处理与失败归因（2026-10-29 新增）。
+
+背景：提案池在 2026-10-29 连续 3 轮产出 0 个候选。上游真实原因是 workbuddy
+免费额度（350 credits/日/账号）被打穿，调用全部 429；但 `_one_call` 把异常吞成
+`[]`，池文件的 error 字段仍是 null，巡检只看到「池内候选 0 个」，与「提案全被
+去重吃掉」无法区分。这里锁住两件事：
+
+1. 429 时尊重 Retry-After，并按 retries 次数退避重试，最后抛 RuntimeError；
+2. 失败原因进 `last_error()`，供提案池写进池文件。
+"""
+import json
+import unittest
+from unittest import mock
+
+from llm import client as C
+
+
+class _Resp:
+    def __init__(self, status_code, headers=None, text=""):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.text = text
+        self.encoding = None
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+            raise requests.HTTPError(f"{self.status_code} error")
+
+
+def _completion(content: str) -> str:
+    return json.dumps({"choices": [{"message": {"content": content}}]})
+
+
+class TestMainModelFollowsHermes(unittest.TestCase):
+    def test_request_uses_live_hermes_main_model(self):
+        resp = _Resp(200, text=_completion("收到"))
+        with (
+            mock.patch.object(C.config, "LLM_API_KEY", "k"),
+            mock.patch.object(C.config, "get_main_model", return_value="wan91/gpt-6-luna") as model,
+            mock.patch.object(C.requests, "post", return_value=resp) as post,
+        ):
+            self.assertEqual(C.chat([{"role": "user", "content": "hi"}]), "收到")
+        self.assertEqual(post.call_args.kwargs["json"]["model"], "wan91/gpt-6-luna")
+        model.assert_called_once_with()
+
+    def test_model_read_failure_fails_closed_before_http(self):
+        with (
+            mock.patch.object(C.config, "LLM_API_KEY", "k"),
+            mock.patch.object(C.config, "get_main_model", side_effect=RuntimeError("no model")),
+            mock.patch.object(C.requests, "post") as post,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "no model"):
+                C.chat([{"role": "user", "content": "hi"}], retries=1)
+        post.assert_not_called()
+
+
+class TestQuotaHandling(unittest.TestCase):
+    def setUp(self):
+        self.main_model = mock.patch.object(C.config, "get_main_model", return_value="wan91/gpt-6-luna")
+        self.main_model.start()
+        self.addCleanup(self.main_model.stop)
+
+    def test_429_honors_retry_after_and_records_error(self):
+        sleeps = []
+        resp = _Resp(429, {"Retry-After": "7"})
+        with mock.patch.object(C.config, "LLM_API_KEY", "k"), \
+             mock.patch.object(C.requests, "post", return_value=resp) as post, \
+             mock.patch.object(C.time, "sleep", side_effect=sleeps.append):
+            with self.assertRaises(RuntimeError) as ctx:
+                C.chat([{"role": "user", "content": "hi"}], retries=2)
+        # 两次尝试都 429 → 按 Retry-After 退避两次
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(sleeps, [7.0, 7.0])
+        self.assertIn("429", str(ctx.exception))
+        self.assertIn("429", C.last_error() or "")
+
+    def test_429_without_retry_after_uses_backoff(self):
+        sleeps = []
+        resp = _Resp(429)
+        with mock.patch.object(C.config, "LLM_API_KEY", "k"), \
+             mock.patch.object(C.requests, "post", return_value=resp), \
+             mock.patch.object(C.time, "sleep", side_effect=sleeps.append):
+            with self.assertRaises(RuntimeError):
+                C.chat([{"role": "user", "content": "hi"}], retries=3)
+        self.assertEqual(sleeps, [5, 10, 15])
+
+    def test_success_path_unchanged(self):
+        resp = _Resp(200, text=_completion("收到"))
+        with mock.patch.object(C.config, "LLM_API_KEY", "k"), \
+             mock.patch.object(C.requests, "post", return_value=resp):
+            out = C.chat([{"role": "user", "content": "hi"}])
+        self.assertEqual(out, "收到")
+
+    def test_empty_content_raises_budget_and_retries(self):
+        """空正文（reasoning 吃光预算）仍按老逻辑加倍重试，不误判成 429。"""
+        resp = _Resp(200, text=_completion(""))
+        with mock.patch.object(C.config, "LLM_API_KEY", "k"), \
+             mock.patch.object(C.requests, "post", return_value=resp), \
+             mock.patch.object(C.time, "sleep", return_value=None):
+            with self.assertRaises(RuntimeError) as ctx:
+                C.chat([{"role": "user", "content": "hi"}], retries=2)
+        self.assertIn("empty content", str(ctx.exception))
+
+
+if __name__ == "__main__":
+    unittest.main()

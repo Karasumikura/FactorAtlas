@@ -24,12 +24,21 @@ import pandas as pd
 PROJ = Path(__file__).resolve().parent.parent
 LEDGER = PROJ / "data" / "binance" / "demo_exec_ledger.jsonl"
 
+# 当前对账的账本名。赛马隔离后两盘各用不同币安账户，
+# 对账必须读**本盘自己的账户**，否则会拿 A 盘的流水去对 B 盘的仓。
+_BOOK: str = ""
+
 
 def set_book(book: str | None) -> None:
-    """账本隔离：重绑成交台账路径（见 core/book.py）。"""
-    global LEDGER
+    """账本隔离：重绑成交台账路径 + 记住账本名（供拉取时选账户）。"""
+    global LEDGER, _BOOK
     from core.book import paths, normalize
-    LEDGER = paths(normalize(book))["ledger"]
+    _BOOK = normalize(book)
+    LEDGER = paths(_BOOK)["ledger"]
+
+
+def get_book() -> str:
+    return _BOOK
 
 
 # ---------------------------------------------------------------------------
@@ -63,16 +72,22 @@ def load_ledger() -> list[dict]:
 # ---------------------------------------------------------------------------
 # 从币安 Demo 拉实际成交 / 资金费
 # ---------------------------------------------------------------------------
-def fetch_demo_trades(symbol: str, testnet: bool = True) -> list[dict]:
+def fetch_demo_trades(symbol: str, testnet: bool = True,
+                      book: str | None = None) -> list[dict]:
+    """拉本盘账户的成交明细。
+
+    book 不传时用 set_book() 记住的账本 → 自动选对账户。
+    """
     from core.binance_exec import BinanceExec
-    c = BinanceExec.from_env(testnet=testnet)
+    c = BinanceExec.from_env(testnet=testnet, book=book or _BOOK or None)
     return c.user_trades(symbol, limit=1000)
 
 
-def fetch_demo_income(symbol: str | None = None, testnet: bool = True) -> list[dict]:
-    """资金费 / 手续费 / 实现盈亏流水（/fapi/v1/income）。"""
+def fetch_demo_income(symbol: str | None = None, testnet: bool = True,
+                      book: str | None = None) -> list[dict]:
+    """资金费 / 手续费 / 实现盈亏流水（/fapi/v1/income）—— 读本盘自己的账户。"""
     from core.binance_exec import BinanceExec
-    c = BinanceExec.from_env(testnet=testnet)
+    c = BinanceExec.from_env(testnet=testnet, book=book or _BOOK or None)
     params = {"limit": 1000}
     if symbol:
         params["symbol"] = symbol
@@ -217,22 +232,31 @@ def main() -> None:
     import argparse
     ap = argparse.ArgumentParser(description="Demo 实盘对账")
     ap.add_argument("--symbols", default="", help="逗号分隔；空=全部")
+    ap.add_argument("--book", default="", choices=["", "lowfreq", "resonance"],
+                    help="账本名；赛马隔离后各盘账户不同，必须指定（空=老账户）")
     ap.add_argument("--testnet", action="store_true", default=True)
     ap.add_argument("--mainnet", dest="testnet", action="store_false")
     ap.add_argument("--save", default=str(PROJ / "runs" / "demo_reconciliation.json"))
     args = ap.parse_args()
 
+    if args.book:
+        set_book(args.book)
+        # 默认输出按账本分开存，避免两盘互相覆盖
+        if args.save == str(PROJ / "runs" / "demo_reconciliation.json"):
+            args.save = str(PROJ / "runs" / f"demo_reconciliation_{args.book}.json")
+
     syms = [x.strip() for x in args.symbols.split(",") if x.strip()]
     try:
         trades = []
         for s in syms or [""]:
-            trades += fetch_demo_trades(s) if s else []
+            trades += fetch_demo_trades(s, args.testnet) if s else []
         income = fetch_demo_income(syms[0] if len(syms) == 1 else None, args.testnet)
     except Exception as e:  # noqa: BLE001
         print(f"拉取 Demo 数据失败（可能未配 key）：{e}")
         print("先用 --mode replay 或补 Demo key 再跑。")
         return
 
+    print(f"账本: {args.book or '(默认/老账户)'}")
     print(f"成交 {len(trades)} 笔，流水 {len(income)} 条")
     funding = compute_funding_income(income)
     print(f"\n=== 资金费 / 手续费（{len(funding)} 个标的）===")

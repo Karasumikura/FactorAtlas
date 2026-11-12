@@ -25,6 +25,12 @@ def _run(ts, name, spec, oos, dsr=None, pbo=None, net=0.5, lowfreq=None):
 SPEC_X = {"op": "mom", "params": {"n": 120}, "direction": 1}
 SPEC_Y = {"op": "vol", "params": {"n": 20}, "direction": 1}
 
+# 2026-11-09：晋升默认值收紧过一次（min_runs 2→5、dsr 0.95→0.999 等），
+# 这些用例是逐个判据的隔离测试，必须显式钉住其余闸门的旧值，
+# 否则默认值一变就集体连坐（当时挂了 5 个）。
+BASE = dict(min_runs=2, dsr_floor=0.95, pbo_ceiling=0.5,
+            min_oos_sharpe=0.3, min_abs_icir=0.03, min_abs_ic=0.0)
+
 
 class TestPromotion(unittest.TestCase):
     def setUp(self):
@@ -36,7 +42,8 @@ class TestPromotion(unittest.TestCase):
             json.dump(run, f)
 
     def _run_promote(self, **kw):
-        return P.promote([str(self.d / "mine_*.json")], verbose=False, **kw)
+        args = {**BASE, **kw}
+        return P.promote([str(self.d / "mine_*.json")], verbose=False, **args)
 
     def test_repeatable_consistent_promoted(self):
         self._write("mine_a.json", _run("2026-01-01", "X", SPEC_X, 0.8, dsr=0.99, pbo=0.2))
@@ -234,6 +241,64 @@ class TestRedundancyGate(unittest.TestCase):
                          f"同族批量候选只该留一个代表，实际留了 {len(kept)} 个")
         self.assertEqual(len(rej), len(specs) - 1)
         self.assertEqual(kept[0]["name"], "vol_n5", "应保留最强（排序第一）的那个")
+
+
+class TestCapacity(unittest.TestCase):
+    """库容量护栏：满了之后按强度截断，且日志里的「新晋」数必须是真新增。
+
+    锁死 2026-10-26 的误导：promote.log 每轮都打「本次晋升 17 个，正式库共 18 个」，
+    实际 17 个全是库内老因子刷新 last_seen，一个都没新增。巡检读日志的人会
+    以为挖掘一直在出因子。
+    """
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self._orig_lib = P.LIB_FILE
+        self._orig_corr = P._max_abs_corr_with
+        P.LIB_FILE = self.d / "lib.json"
+        P._max_abs_corr_with = lambda *a, **k: 0.0
+        P._FACTOR_CACHE.clear()
+
+    def tearDown(self):
+        P.LIB_FILE = self._orig_lib
+        P._max_abs_corr_with = self._orig_corr
+        P._FACTOR_CACHE.clear()
+
+    def _write(self, fname, run):
+        (self.d / fname).write_text(json.dumps(run))
+
+    def test_capacity_keeps_strongest_and_reports_true_new_count(self):
+        specs = [{"op": "mom", "params": {"n": n}, "direction": 1}
+                 for n in (40, 60, 80, 100, 120)]
+        names = {n: f"mom_n{n}_x" for n in (40, 60, 80, 100, 120)}
+        # 故意让强因子的 n 排在后面，验证截断前有排序
+        for i, sp in enumerate(specs):
+            n = sp["params"]["n"]
+            self._write(f"mine_{i}.json",
+                        _run(f"2026-01-0{i + 1}", names[n], sp,
+                             0.3 + n / 500.0, dsr=0.99, pbo=0.2))
+        for i, sp in enumerate(specs):
+            n = sp["params"]["n"]
+            self._write(f"mine_b{i}.json",
+                        _run(f"2026-02-0{i + 1}", names[n], sp,
+                             0.3 + n / 500.0, dsr=0.99, pbo=0.2))
+
+        # 容量 2：应该留下最强的 mom_n120 / mom_n100，不是遍历顺序的第一批
+        r = P.promote([str(self.d / "mine_*.json")], verbose=False, max_library=2,
+                      **BASE)
+        lib = json.loads(P.LIB_FILE.read_text())
+        kept = sorted(v["name"] for v in lib["factors"].values())
+        self.assertEqual(kept, sorted([names[100], names[120]]),
+                         f"容量截断应按 |oos_median| 保留最强的，实际 {kept}")
+        self.assertEqual(r["n_newly_promoted"], 2)
+        self.assertEqual(r["n_library"], 2)
+
+        # 再跑一次：库已满且无更强候选 → 新晋必须是 0，不能重复报 2
+        r2 = P.promote([str(self.d / "mine_*.json")], verbose=False, max_library=2,
+                       **BASE)
+        self.assertEqual(r2["n_newly_promoted"], 0,
+                         f"老因子刷新不应计入新晋，实际 {r2['n_newly_promoted']}")
+        self.assertEqual(r2["n_library"], 2)
 
 
 if __name__ == "__main__":

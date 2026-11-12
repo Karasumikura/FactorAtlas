@@ -91,7 +91,11 @@ run_group "test_proposal*.py"   "提案池"
 # 新增 pytest 风格测试文件时，**必须**同时加进下面两处：PYTEST_FILES 和
 # 循环里的 case 排除列表，否则会被 run_file 接手并误报 NO TESTS RAN。
 PYTEST_FILES="tests/test_book_isolation.py tests/test_notify_book_label.py
-tests/test_rebalance_calendar.py tests/test_resonance_strategy.py tests/test_news_adjust.py"
+tests/test_rebalance_calendar.py tests/test_resonance_strategy.py tests/test_news_adjust.py
+tests/test_funding_view.py tests/test_llm_order_parse.py tests/test_trial_window_dedup.py
+tests/test_ops_book_silence.py tests/test_ops_dd_headroom.py
+tests/test_alt_data.py tests/test_api_hub.py tests/test_cpcv_eval.py
+tests/test_edgar_event.py tests/test_evolution.py tests/test_rejection_memory.py"
 pytest_run() {
     local out rc summary
     out=$("$PY" -m pytest $PYTEST_FILES -q 2>&1)
@@ -111,6 +115,9 @@ for f in $(ls tests/test_*.py 2>/dev/null); do
     case "$b" in
         test_*gate*.py|test_promote.py|test_factor*.py|test_proposal*.py) continue ;;
         test_book_isolation.py|test_notify_book_label.py|test_rebalance_calendar.py|test_resonance_strategy.py|test_news_adjust.py) continue ;;
+        test_funding_view.py|test_llm_order_parse.py|test_trial_window_dedup.py) continue ;;
+        test_ops_book_silence.py|test_ops_dd_headroom.py) continue ;;
+        test_alt_data.py|test_api_hub.py|test_cpcv_eval.py|test_edgar_event.py|test_evolution.py|test_rejection_memory.py) continue ;;
     esac
     run_file "$f" "${b#test_}"
 done

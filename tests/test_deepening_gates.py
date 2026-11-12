@@ -44,11 +44,51 @@ class TestForceDerisk(unittest.TestCase):
                                  math.copysign(1, o.cur_qty),
                                  f"{o.binance_symbol} 方向被翻")
 
-    def test_no_action_when_exposure_below_target(self):
-        # 当前 gross=115，gross_cap=2.0、dd=0.12 -> target=176 > 115 -> 不动
+    def test_low_exposure_still_trims(self):
+        """低仓位账本也必须真降险（2026-11-01 修复的核心回归）。
+
+        原实现里目标 = gross_cap*equity*(1-dd) = 176 > 当前 115，
+        直接判定「敞口已够低」返回空单 —— 熔断器在 0.57x 仓位上完全是摆设。
+        现在目标改为 min(仓位上限, 当前敞口)*(1-dd) = 101.2，必须产出减仓单。
+        """
         small = {"A": 1.0, "B": 2.0, "C": -1.5, "D": 0.5}
+        cur_gross = 115.0
+        target = min(2.0 * self.eq, cur_gross) * (1 - 0.12)   # 101.2
         orders = force_derisk([], self.eq, self.prices, small, 0.12, gross_cap=2.0)
-        self.assertEqual(orders, [])
+        self.assertTrue(orders, "低仓位 + 越线回撤必须产出降险单")
+        left = cur_gross - sum(abs(o.delta_qty * o.ref_price) for o in orders)
+        self.assertLessEqual(left, target + 1e-6, "降险后 gross 必须压到目标以下")
+
+    def test_orders_respect_min_notional(self):
+        """每一张单的名义额都必须 >= 最小名义额，否则发出去必被交易所拒。"""
+        orders = force_derisk([], self.eq, self.prices, self.cur, 0.35,
+                              gross_cap=2.0, min_notional=5.0)
+        self.assertTrue(orders)
+        for o in orders:
+            self.assertGreaterEqual(o.notional, 5.0 - 1e-9,
+                                    f"{o.binance_symbol} 名义 {o.notional:.2f} < 5U")
+
+    def test_low_exposure_uses_whole_leg_close(self):
+        """低仓位下比例微调全被最小名义额挡住时，必须整腿平仓兜底。
+
+        真实账户形状（2026-11-01）：7 腿、gross 56.64、dd 10.98%。
+        按比例每腿只能减 0.31~1.71U，全部 < 5U；不整腿平仓就永远减不掉。
+        """
+        prices = {"GOOGL": 282.17, "PLTR": 184.97, "HOOD": 85.57, "META": 615.73,
+                  "MSTR": 132.31, "CRCL": 73.13, "INTC": 65.04}
+        cur = {"GOOGL": 0.01, "PLTR": 0.03, "HOOD": 0.07, "META": 0.01,
+               "MSTR": 0.05, "CRCL": 0.19, "INTC": 0.24}
+        cur_gross = sum(abs(q) * prices[s] for s, q in cur.items())
+        target = cur_gross * (1 - 0.1098)
+        orders = force_derisk([], 100.0, prices, cur, 0.1098,
+                              gross_cap=1.2, min_notional=5.0)
+        self.assertTrue(orders, "真实低仓位账本必须能产出可执行的降险单")
+        for o in orders:
+            self.assertGreaterEqual(o.notional, 5.0 - 1e-9)
+            self.assertLessEqual(abs(o.target_qty), abs(o.cur_qty) + 1e-9, "不许加仓")
+        left = cur_gross - sum(abs(o.delta_qty * o.ref_price) for o in orders)
+        self.assertLessEqual(left, target + 1e-6)
+        self.assertGreaterEqual(left, target * 0.5 - 1e-6, "不许一次砍到目标一半以下")
 
     def test_zero_drawdown_no_action(self):
         orders = force_derisk([], self.eq, self.prices, self.cur, 0.0, gross_cap=2.0)

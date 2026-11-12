@@ -56,10 +56,18 @@ def act(rep: dict, do_prune: bool = False) -> list[str]:
     """根据快照执行白名单自愈动作，返回动作记录。"""
     actions: list[str] = []
     svcs = rep.get("services", {})
-    # 只自愈交易与挖掘服务；y2a 属另一条线，仅报告由它自己的服务守护
-    for name in ("quant-trader", "quant-miner"):
+    # 只自愈交易服务；y2a 属另一条线，仅报告由它自己的服务守护。
+    # 挖掘 2026-11-05 迁到深圳机：本机没有 quant-miner.service，本地 restart 只会
+    # 拿到 "Unit not found"，所以改走 SSH 到远端重启（_sz_miner_state 已给出状态）。
+    # 2026-11-07：原来只守 quant-trader，共振盘挂了没人拉起来
+    for name in ("quant-trader", "quant-trader-resonance"):
         if svcs.get(name) is False:
             actions.append(_restart(name))
+    mn = rep.get("miner") or {}
+    if mn.get("reachable") and mn.get("running") is False:
+        rc, out = _sh(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                       "sz", "systemctl", "restart", "quant-miner"], timeout=90)
+        actions.append(f"restart sz:quant-miner: rc={rc} {out[:100]}")
     # 磁盘预警时清理超期 ops 日志（安全，只删自家 ops 日志）
     disk = rep.get("disk", {})
     if disk.get("free_gb", 999) < 2.0:

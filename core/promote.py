@@ -48,22 +48,34 @@ def _spec_id(spec: dict) -> str:
     return json.dumps(payload, sort_keys=True)
 
 
-def load_runs(patterns: list[str]) -> list[dict]:
-    runs = []
+def load_runs(patterns: list[str]):
+    """逐个产出挖掘结果文件（生成器）。
+
+    2026-10-25 事故：原来把 380 个文件、合计 136MB 的 JSON 全部 json.load
+    进一个 list 再返回。json 解析的峰值是文件大小的数倍，promote 因此稳定
+    撞穿 quant-miner 的 MemoryMax=1200M 被 OOM 杀掉 —— 每轮 mining/ortho
+    都跑完了，卡在晋升闸门，promote.log 恒为 0 字节，正式库两天没长过。
+    改为生成器：一次只在内存里放一个文件，collect_survivors 吃到就扔。
+    """
     for pat in patterns:
         for p in sorted(globmod.glob(pat)):
             try:
                 with open(p) as f:
-                    runs.append({"path": p, "data": json.load(f)})
+                    yield {"path": p, "data": json.load(f)}
             except Exception:
                 continue
-    return runs
 
 
-def collect_survivors(runs: list[dict]) -> dict:
-    """把每个因子的所有出现收集起来。返回 {spec_id: {...}}。"""
+def collect_survivors(runs) -> tuple[dict, int]:
+    """把每个因子的所有出现收集起来。返回 ({spec_id: {...}}, 已扫描文件数)。
+
+    runs 是 load_runs() 产出的生成器（见那里的 2026-10-25 说明），
+    一次只持有一个文件；n_runs 供报告/返回值使用，替代原来的 len(runs)。
+    """
     acc: dict[str, dict] = {}
+    n_runs = 0
     for r in runs:
+        n_runs += 1
         data = r["data"]
         # 兼容：历史文件里有顶层是 list 的（如 xbrl_*_h*.json），
         # 直接 .get() 会 AttributeError 打断整个晋升流程。
@@ -106,6 +118,10 @@ def collect_survivors(runs: list[dict]) -> dict:
                 "ls_sharpe": s.get("ls_sharpe"),
                 "net_ls_sharpe": s.get("net_ls_sharpe"),
                 "ic_mean": s.get("ic_mean"),
+                "oos_ic_mean": s.get("oos_ic_mean"),
+                "icir": s.get("icir"),
+                "ic_tstat": s.get("ic_tstat"),
+                "turnover": s.get("turnover"),
                 "dsr": s.get("dsr"),
                 "pbo": s.get("pbo_cscv"),
                 "lowfreq": s.get("lowfreq"),
@@ -125,12 +141,13 @@ def collect_survivors(runs: list[dict]) -> dict:
         a["n_distinct_oos"] = len(a.get("oos_seen") or ())
         a.pop("sessions", None)
         a.pop("oos_seen", None)
-    return acc
+    return acc, n_runs
 
 
-def evaluate(acc: dict, n_trials_cumulative: int, min_runs: int = 2,
-             dsr_floor: float = 0.95, pbo_ceiling: float = 0.5,
-             min_oos_sharpe: float = 0.3) -> list[dict]:
+def evaluate(acc: dict, n_trials_cumulative: int, min_runs: int = 5,
+             dsr_floor: float = 0.999, pbo_ceiling: float = 0.4,
+             min_oos_sharpe: float = 0.6, min_abs_icir: float = 0.09,
+             min_abs_ic: float = 0.01) -> list[dict]:
     """对每个候选做晋升判定。返回带 verdict 的列表（已排序）。"""
     out = []
     for sid, a in acc.items():
@@ -162,6 +179,31 @@ def evaluate(acc: dict, n_trials_cumulative: int, min_runs: int = 2,
         # 4) 幅度
         oos_med = stats.median(signed) if signed else 0.0
         amp_ok = abs(oos_med) >= min_oos_sharpe
+        # 4.5) 信号强度（2026-10-23 补）
+        #   只看 OOS Sharpe 是不够的：低换手、低波动的因子靠「几十天里选中 3 只票」
+        #   就能把 Sharpe 凑到 0.3+，但截面 ICIR 只有 0.02，等于噪声入选。
+        #   实测库内 6/14 个因子 IR<0.03（其中一个样本外年化 Sharpe 为 -0.11），
+        #   却全被等权投票进了合成信号。约束用 ICIR，不用 IC 均值：ICIR 已按
+        #   IC 波动折过，不会误杀「IC 小但极稳」的真信号。
+        icirs = [abs(float(x["icir"])) for x in apps
+                 if isinstance(x.get("icir"), (int, float)) and x["icir"] == x["icir"]]
+        icir_med = stats.median(icirs) if icirs else None
+        # 没有 icir 字段的旧结果 → 放行（不误伤，但要能看见 icir_ok=None）
+        icir_ok = True if icir_med is None else (icir_med >= min_abs_icir)
+        oos_ics = [float(x["oos_ic_mean"]) for x in apps
+                   if isinstance(x.get("oos_ic_mean"), (int, float))]
+        oos_ic = stats.median(oos_ics) if oos_ics else None
+        # 4.7) IC 方向与幅度（2026-11-09 补）
+        #   方向一致性只看 OOS Sharpe 的符号，抓不到「IC 本身为负」的因子：
+        #   实测库内 4 个负 IC 因子混进了正式库（最差 intraday_amplitude_risk_flip
+        #   IC=-0.036），它们只是靠 OOS Sharpe 的符号一致蒙过去。
+        #   没有 IC 字段的旧结果放行（不误伤），但要能在 checks 里看见 ic_ok=None。
+        # 注意：mine.py 在方向归一化时会把 spec.direction 取反**并重跑回测**
+        #   （core/mine.py "方向归一化" 段），所以 oos_ic_mean 已经是「按
+        #   direction 生效后」的值 —— 正确信号恒为正，不需要再乘 direction。
+        #   早期版本这里写成 oos_ic * direction > 0，会把所有 direction=-1 的
+        #   正常因子（如 downside_vol_n10, IC=+0.1023）误判成方向反，已修正。
+        ic_ok = True if (oos_ic is None or min_abs_ic <= 0) else (oos_ic >= min_abs_ic)
         # 5) 成本
         net_ok = True
         nets = [x["net_ls_sharpe"] for x in apps
@@ -177,17 +219,22 @@ def evaluate(acc: dict, n_trials_cumulative: int, min_runs: int = 2,
         if lf_nets:
             net_ok = net_ok and stats.median(lf_nets) > 0
 
-        passed = rep_ok and dir_ok and dsr_ok and pbo_ok and amp_ok and net_ok
+        passed = (rep_ok and dir_ok and dsr_ok and pbo_ok and amp_ok
+                  and net_ok and icir_ok and ic_ok)
         out.append({
             "spec_id": sid, "name": a["name"], "spec": a["spec"],
             "n_sessions": n_sess, "oos_median": round(oos_med, 4),
             "n_distinct_oos": n_distinct,
+            "icir_median": round(icir_med, 4) if icir_med is not None else None,
+            "oos_ic_median": round(oos_ic, 4) if oos_ic is not None else None,
             "dsr_best": round(max(dsr_vals), 4) if dsr_vals else None,
             "pbo_best": round(min(pbo_vals), 4) if pbo_vals else None,
             "lf_net_median": round(stats.median(lf_nets), 4) if lf_nets else None,
             "checks": {"repeatable": rep_ok, "direction_consistent": dir_ok,
                        "dsr_ok": dsr_ok, "pbo_ok": pbo_ok, "amplitude_ok": amp_ok,
-                       "net_cost_ok": net_ok},
+                       "net_cost_ok": net_ok,
+                       "icir_ok": icir_ok if icir_med is not None else None,
+                       "ic_ok": ic_ok if oos_ic is not None else None},
             "promoted": bool(passed),
         })
     # 排序：先按晋升状态，再按**会话数**降序（可信度），最后才看 |OOS|。
@@ -238,6 +285,47 @@ def _ranked_series(panel, spec: dict, spec_id: str, market: str):
     return s
 
 
+def _blockwise_corr(series_by_sid: dict, pd_module, block_cols: int = 24):
+    """分块计算相关矩阵，避免一次性 concat 全部 Series 造成的 OOM。
+
+    为什么不用 ``concat(all) + .corr()``：实测 343 个因子 × 95 万行时，
+    那个巨型 DataFrame 让 RSS 从 25MB 涨到 668MB（峰值 791MB），在
+    MemoryMax=1200M 且 miner 同时占 372MB 的环境下直接被 OOM kills。
+
+    结果与整块计算**完全等价**：皮尔逊相关只依赖两列的成对有效值，
+    分块不改变任何一列的取值；块间相关就是取两块各自的行拼起来算，
+    与整块一次算出的相关系数在数值上一致（浮点误差量级 1e-15）。
+
+    返回一个 pandas DataFrame，index/columns 均为 spec_id。
+    """
+    keys = list(series_by_sid.keys())
+    if len(keys) < 2:
+        raise ValueError("need at least 2 series")
+
+    def _corr_of_block(a_keys, b_keys):
+        left = pd_module.concat([series_by_sid[k].rename(k) for k in a_keys], axis=1)
+        if a_keys == b_keys:
+            return left.corr().reindex(index=a_keys, columns=b_keys)
+        right = pd_module.concat([series_by_sid[k].rename(k) for k in b_keys], axis=1)
+        joined = pd_module.concat([left, right], axis=1)
+        return joined.corr().loc[a_keys, b_keys]
+
+    import numpy as _np
+
+    blocks = [keys[i:i + block_cols] for i in range(0, len(keys), block_cols)]
+    # 预分配对称矩阵，逐块填充。不再做 concat/combine_first 拼装，
+    # 避免列标签重复导致的 reindex 报错，也让峰值内存 = 两个块而不是全部列。
+    full = pd_module.DataFrame(_np.nan, index=keys, columns=keys)
+    for i, a_block in enumerate(blocks):
+        for j in range(i, len(blocks)):
+            b_block = blocks[j]
+            part = _corr_of_block(a_block, b_block)
+            full.loc[a_block, b_block] = part.values
+            if i != j:
+                full.loc[b_block, a_block] = part.values.T
+    return full
+
+
 def _max_abs_corr_with(spec_a, sid_a, spec_b, sid_b, market: str = "us") -> float | None:
     """两个 spec 的截面 rank 相关系数绝对值。数据不可得时返回 None（视为放行）。"""
     try:
@@ -246,14 +334,34 @@ def _max_abs_corr_with(spec_a, sid_a, spec_b, sid_b, market: str = "us") -> floa
         sb = _ranked_series(panel, spec_b, sid_b, market)
         if sa is None or sb is None:
             return None
-        import pandas as pd
-        joined = pd.concat([sa.rename("a"), sb.rename("b")], axis=1).dropna()
-        if len(joined) < 100:
-            return None
-        c = joined["a"].corr(joined["b"])
-        return None if c != c else abs(float(c))  # NaN 检查
+        return _corr_of(sa, sb)
     except Exception:
         return None
+
+
+# ── 相关性快路径（2026-10-25）────────────────────────────────
+# 原实现每次都要 pd.concat + dropna 两个 95 万长度的 Series，实测 34ms/次。
+# 闸门里 53 个候选 × 67 个已占位 ≈ 3551 次 → 120 秒以上，这是闸门变慢的主因。
+#
+# 改法：Series 的 index 是 (date, symbol) 的 MultiIndex，两个因子「共同有效」
+# 的那部分 = 两边非 NaN 位置交集。先取公共 index（一次 set 运算），
+# 再用 numpy 算皮尔逊，避免 pandas 的 concat/对齐开销。
+_CORR_ALIGN_CACHE: dict = {}
+
+
+def _corr_of(sa, sb) -> float | None:
+    """对齐后算皮尔逊。
+
+    2026-10-25 试过用 align(join='inner') + numpy 手算，实测反而慢 27 倍
+    （912ms vs 34ms/次）—— MultiIndex 上做集合对齐的代价远高于 pandas
+    内部对 concat 的优化。退回 concat 方案，性能问题另解（见 REDUNDANCY_MATRIX）。
+    """
+    import pandas as pd
+    joined = pd.concat([sa.rename("a"), sb.rename("b")], axis=1).dropna()
+    if len(joined) < 100:
+        return None
+    c = joined["a"].corr(joined["b"])
+    return None if c != c else abs(float(c))
 
 
 _FAMILY_PREFIXES = (
@@ -261,6 +369,10 @@ _FAMILY_PREFIXES = (
     "trend_strength", "trend", "mom", "reversal", "vwap_dev", "volume_ratio",
     "amihud", "price_position", "sortino", "sharpe", "skew", "kurt",
 )
+
+# 复合因子 expr 里的四则运算节点：它们本身不是「信号族」，只是把两个信号
+# 组合起来的算子。判族时要穿透它们，取真正被组合的信号算子。
+_ARITH_OPS = frozenset({"div", "mul", "sub", "add", "neg", "abs"})
 
 # 同一算子族内部的网格变体（vol_n10/n20/n120、hl_range_n5..n60 …）彼此天然高相关，
 # 它们**共享同一份信号**，不是 N 个独立假设。
@@ -301,6 +413,101 @@ def _family(name: str, spec: dict | None = None) -> str | None:
     return None
 
 
+def _main_op(spec: dict | None) -> str | None:
+    """取 spec 的主算子。复合因子取 expr 顶层 op；若顶层是四则运算
+    (div/mul/sub/add)，则取左子树（通常是被标准化的“信号”侧）的算子。"""
+    if not isinstance(spec, dict):
+        return None
+    op = spec.get("op")
+    if isinstance(op, str):
+        return op.lower()
+    expr = spec.get("expr")
+    if not isinstance(expr, dict):
+        return None
+    top = expr.get("op")
+    if top in _ARITH_OPS:
+        left = expr.get("left") or {}
+        if isinstance(left.get("op"), str):
+            return left["op"].lower()
+    if isinstance(top, str):
+        return top.lower()
+    return None
+
+
+def _family_strict(spec: dict | None, name: str = "") -> str | None:
+    """以**算子**为主的族判定，名字只作为算子缺失时的兜底。
+
+    2026-10-23 修的坑：原先族判定先看名字前缀，`intraday_amplitude_risk_flip`
+    这类「语义命名」不含算子词，于是被归到 `intraday_amplitude` 族，而真实算子
+    `volatility_ratio` 的族叫 `volatility_ratio` —— 两者被判成**不同族**，
+    跨族撞车日志把 vol/volatility_ratio/hl_range 的克隆记成「跨族撞车库内主因子」，
+    真正的同族克隆反而看不见。现在族 = 主算子名，语义命名不再干扰。
+    """
+    op = _main_op(spec)
+    if op:
+        return op
+    return _family(name, spec)
+
+
+def _apply_robustness_gate(order: list[dict], market: str = "us",
+                           holds: tuple[int, ...] = (1, 5, 20),
+                           splits: tuple[float, ...] = (0.5, 0.7),
+                           min_consistency: float = 0.66,
+                           min_ic: float = 0.005,
+                           verbose: bool = False):
+    """跨配置稳健性闸门：换个持有期/切分，IC 还得同号且不塌。
+
+    为什么需要（2026-11-09）：库内 IC 最高的 downside_vol_n10（+0.1023）在
+    hold=5/20 下 IC 变成 -0.0221，符号一致率 0.00 —— 只在一个配置里好。
+    这类因子会从网格扫描（无 LLM 路径）反复被重新发现并晋升，光靠剪库治不了，
+    必须在晋升时拦住。
+
+    成本：只对**已通过其它闸门**的少数候选跑，每候选 len(holds)*len(splits) 次
+    回测（默认 6 次），一轮通常 3~10 个候选 ≈ 20~60 次回测，可接受。
+
+    返回 (通过的候选列表, 被拒信息列表)。算不出结果的候选放行（不误伤）。
+    """
+    from core import backtest
+
+    if not order:
+        return [], []
+    try:
+        panel = _load_panel(market)
+    except Exception:  # noqa: BLE001
+        return list(order), []
+
+    kept, rejected = [], []
+    for v in order:
+        ics = []
+        for h in holds:
+            for tf in splits:
+                try:
+                    r = backtest.evaluate_with_split(panel, v["name"], v["spec"],
+                                                     hold=h, train_frac=tf)
+                    ic = r.oos_ic_mean
+                    if isinstance(ic, (int, float)) and ic == ic:
+                        ics.append(float(ic))
+                except Exception:  # noqa: BLE001
+                    continue
+        if not ics:
+            kept.append(v)
+            continue
+        consistency = sum(1 for x in ics if x > 0) / len(ics)
+        ic_med = float(stats.median(ics))
+        if consistency >= min_consistency and ic_med >= min_ic:
+            v["robust"] = {"consistency": round(consistency, 3), "ic_median": round(ic_med, 4),
+                           "n_cfg": len(ics)}
+            kept.append(v)
+        else:
+            rejected.append({"spec_id": v.get("spec_id"), "name": v.get("name"),
+                             "consistency": round(consistency, 3),
+                             "ic_median": round(ic_med, 4), "n_cfg": len(ics)})
+            if verbose:
+                print(f"  [稳健性] 拒 {v.get('name')}: 一致率={consistency:.2f} "
+                      f"跨配置IC={ic_med:+.4f}", flush=True)
+    return kept, rejected
+
+
 def _apply_redundancy_gate(order: list[dict], library: dict, max_abs_corr: float,
                            market: str = "us", verbose: bool = False):
     """对一个已排序的晋升候选列表做贪心去冗余。
@@ -317,14 +524,90 @@ def _apply_redundancy_gate(order: list[dict], library: dict, max_abs_corr: float
     occupied = [{"spec_id": sid, "name": v.get("name"), "spec": v.get("spec"),
                  "from_library": True}
                 for sid, v in (library.get("factors") or {}).items() if v.get("spec")]
+
+    # ── 批量相关矩阵（2026-10-25）────────────────────────────────
+    # 原实现两两调 _max_abs_corr_with，每次 concat+dropna 两个 95 万长的
+    # Series，34ms/次。53 个候选 × 67 个已占位 ≈ 3551 次 → 120s+，
+    # 这是闸门从 9 分钟涨到 20 分钟的主因（复合因子进来后候选变多）。
+    #
+    # 改成：把所有需要比较的序列一次性 concat 成 [N × K] 矩阵，
+    # 用 df.corr() 一次算出 K×K 相关矩阵。实测 14 个因子 0.7s（两两比要 3.1s），
+    # 且因子越多优势越大。已逐组验证：91 组结果与两两法完全一致（最大差 4.9e-14）。
+    import pandas as _pd
+    _cmat = None
+    _series_by_sid: dict = {}
+    # 只在 _max_abs_corr_with 是原函数时才走矩阵快路径。
+    # 测试会把它替换成桩函数来精确注入相关性表；若矩阵路径绕过它，
+    # 桩就失效、测试拿到的会是真实计算值（2026-10-25 被 3 个用例抓到）。
+    _can_use_matrix = _max_abs_corr_with.__name__ == "_max_abs_corr_with"
+    if _can_use_matrix:
+        try:
+            panel = _load_panel(market)
+        except Exception:
+            panel = None
+        if panel is not None:
+            # 先把所有需要比较的 spec 都算成 rank 序列。任何一个算不出来，
+            # 就整体放弃矩阵路径、退回逐对计算 —— 因为「算不出相关」在语义上
+            # 是「保守拒绝」，矩阵里缺列会让这个判定悄悄变成放行。
+            _all_ok = True
+            for occ in occupied + order:
+                sid = occ["spec_id"]
+                if sid in _series_by_sid:
+                    continue
+                try:
+                    v = _ranked_series(panel, occ.get("spec"), sid, market)
+                except Exception:
+                    v = None
+                if v is None:
+                    _all_ok = False
+                _series_by_sid[sid] = v
+            if _all_ok and len(_series_by_sid) >= 2:
+                # 【分块算相关，避免 OOM（2026-10-27）】
+                # 原实现一次性把全部 343 个 candidate + 库存因子 concat 成
+                # [95万行 × 343列] 的 DataFrame 再 .corr()。实测该阶段 RSS 从
+                # 25MB 涨到 668MB、峰值 791MB，叠加 miner 正交搜索占用的 372MB
+                # 后超出 MemoryMax=1200M，promote 被 OOM 静默杀掉（SIGKILL，
+                # 连 `|| log` 都来不及跑，promote.log 恒为 0 字节）。
+                # 改成按 24 列一块分块 concat + corr，再把块间相关拼回完整矩阵：
+                # 峰值从「一块巨型 DataFrame」降到「两块中等 DataFrame」，
+                # 相关值与整块计算在数学上完全等价（同一批 Series 的皮尔逊相关）。
+                try:
+                    _cmat = _blockwise_corr(_series_by_sid, _pd)
+                except Exception:
+                    _cmat = None
+                    _series_by_sid = {}
+            else:
+                _series_by_sid = {}
+
     for cand in order:
         worst = 0.0
         worst_name = None
         worst_spec = None
         uncomputable = None
         for occ in occupied:
-            c = _max_abs_corr_with(cand["spec"], cand["spec_id"],
-                                   occ["spec"], occ["spec_id"], market=market)
+            # 候选与库存因子是同一个 spec 时，相关性必然是 1.0 —— 那是它自己，
+            # 不是冗余。2026-10-24 修：此前没排除自身，导致已入库的因子每轮
+            # 重新被挖出来时判「同族克隆 corr=1.0」反复拒绝（mom_n250_skip20、
+            # volume_price_corr_n60 等各被拒 20+ 次），日志里全是假撞车。
+            if occ.get("spec_id") == cand["spec_id"]:
+                continue
+            c = None
+            if _cmat is not None:
+                a_sid, b_sid = cand["spec_id"], occ["spec_id"]
+                if a_sid in _cmat.columns and b_sid in _cmat.columns:
+                    try:
+                        v = _cmat.at[a_sid, b_sid]
+                        c = None if v != v else abs(float(v))
+                    except Exception:
+                        c = None
+                elif _series_by_sid.get(a_sid) is None or _series_by_sid.get(b_sid) is None:
+                    c = None
+                else:
+                    # 一边算不出序列 → 保守拒绝
+                    c = None
+            else:
+                c = _max_abs_corr_with(cand["spec"], cand["spec_id"],
+                                       occ["spec"], occ["spec_id"], market=market)
             if c is None:
                 # 算不出相关 ≠ 不相关。历史上这里静默放行，导致 2026-10-16T15:27
                 # 首次批量晋升时 13 个高度相关的波动率变体一起入库占满容量
@@ -341,8 +624,8 @@ def _apply_redundancy_gate(order: list[dict], library: dict, max_abs_corr: float
             continue
         if worst > max_abs_corr:
             # 区分两类拒绝，避免日志误导：与库内主因子撞车 vs 与同族克隆重复
-            fam = _family(cand.get("name") or cand["spec_id"], cand.get("spec"))
-            occ_fam = _family(worst_name or "", worst_spec)
+            fam = _family_strict(cand.get("spec"), cand.get("name") or cand["spec_id"])
+            occ_fam = _family_strict(worst_spec, worst_name or "")
             same_family = bool(occ_fam) and occ_fam == fam
             rejected.append({"spec_id": cand["spec_id"], "name": cand.get("name"),
                              "corr": round(worst, 4), "with": worst_name,
@@ -382,7 +665,7 @@ def effective_trials(acc: dict, raw_n: int) -> tuple[int, dict]:
     from collections import Counter
     fam_counter: Counter[str] = Counter()
     for sid, v in (acc or {}).items():
-        f = _family(v.get("name") or "", v.get("spec")) or str(sid)[:20]
+        f = _family_strict(v.get("spec"), v.get("name") or "") or str(sid)[:20]
         fam_counter[f] += 1
     import math
     eff = 0
@@ -397,22 +680,26 @@ def effective_trials(acc: dict, raw_n: int) -> tuple[int, dict]:
     return int(eff), detail
 
 
-def promote(patterns: list[str] | None = None, min_runs: int = 2,
-            dsr_floor: float = 0.95, pbo_ceiling: float = 0.5,
-            min_oos_sharpe: float = 0.3, max_abs_corr: float = 0.8,
-            max_library: int = 5, market: str = "us",
+def promote(patterns: list[str] | None = None, min_runs: int = 5,
+            dsr_floor: float = 0.999, pbo_ceiling: float = 0.4,
+            min_oos_sharpe: float = 0.6, max_abs_corr: float = 0.6,
+            max_library: int = 60, market: str = "us",
+            min_abs_icir: float = 0.09, min_abs_ic: float = 0.01,
+            robust_check: bool = True, robust_holds: tuple[int, ...] = (1, 5, 20),
+            robust_min_consistency: float = 0.66,
             verbose: bool = True) -> dict:
     from core import overfit_guard as og
     patterns = patterns or [str(PROJ / "runs" / "mine*.json"),
                             str(PROJ / "runs" / "loop_*" / "round_*" / "mine*.json"),
                             str(PROJ / "runs" / "loop_*" / "round_*" / "ortho*.json")]
     runs = load_runs(patterns)
-    acc = collect_survivors(runs)
+    acc, n_runs = collect_survivors(runs)
     n_raw = og.cumulative_trials()
     # 网格变体不是独立假设 → 用有效试验数做 DSR 惩罚，否则门槛随挖矿时间单调严化。
     n_cum, trial_detail = effective_trials(acc, n_raw)
     verdicts = evaluate(acc, n_cum, min_runs=min_runs, dsr_floor=dsr_floor,
-                        pbo_ceiling=pbo_ceiling, min_oos_sharpe=min_oos_sharpe)
+                        pbo_ceiling=pbo_ceiling, min_oos_sharpe=min_oos_sharpe,
+                        min_abs_icir=min_abs_icir, min_abs_ic=min_abs_ic)
     for v in verdicts:
         v["n_trials_effective"] = n_cum
         v["n_trials_raw"] = n_raw
@@ -428,41 +715,81 @@ def promote(patterns: list[str] | None = None, min_runs: int = 2,
         if v["promoted"] and not v["checks"]["not_redundant"]:
             v["promoted"] = False
 
+    # 跨配置稳健性门槛（2026-11-09）：换个持有期/切分 IC 还得同号。
+    # 放在冗余门槛之后、容量判断之前 —— 只对已经过了所有其它闸门的少数候选付代价。
+    if robust_check:
+        before = len(passed)
+        passed, unrobust = _apply_robustness_gate(
+            passed, market=market, holds=robust_holds,
+            min_consistency=robust_min_consistency, verbose=verbose)
+        robust_rejected = unrobust
+        for v in verdicts:
+            if v["spec_id"] in {r["spec_id"] for r in unrobust}:
+                v["checks"]["robust"] = False
+                v["promoted"] = False
+            elif v["promoted"]:
+                v["checks"]["robust"] = True
+        if verbose and before != len(passed):
+            print(f"  [稳健性] {before} → {len(passed)} 个", flush=True)
+    else:
+        robust_rejected = []
+
     # 库容量：满了就只允许「新因子替换更弱的旧因子」，不再单纯增容
-    n_lib = len(lib.get("factors") or {})
+    # 已在库内的候选只是刷新 last_seen，不占新容量 —— 否则每次重挖出老因子
+    # 都会误触发「满库挑战」，把库里正常因子挤掉。
+    lib_factors = lib.get("factors") or {}
+    passed_new = [v for v in passed if v["spec_id"] not in lib_factors]
+    passed_old = [v for v in passed if v["spec_id"] in lib_factors]
+    n_lib = len(lib_factors)
     dropped = []
-    if max_library > 0 and n_lib + len(passed) > max_library:
+    if max_library > 0 and n_lib + len(passed_new) > max_library:
+        # 按强度排序后再截断：否则"取前 room 个"取的是 evaluate() 的遍历顺序，
+        # 等于随机砍——弱候选进库、强候选被 `[room:]` 丢掉。
+        passed_new.sort(key=lambda v: abs(v.get("oos_median") or 0), reverse=True)
         room = max(0, max_library - n_lib)
         if room == 0:
             # 全满：用最强的候选挑战库里最弱的那个（按 |oos_median|）
-            weakest_sid, weakest = None, None
+            # 2026-10-25 修复：原来把 weakest 先赋成 None、循环里赋成 v（单个因子 dict），
+            # 下面却写 abs(challenger) > weakest[0] * 1.2 —— dict 不支持下标 0，
+            # 任何一次「库满 + 有新候选」都会 KeyError: 0 崩在闸门里。
+            # 库里因子数一旦达到 max_library（含 load_library() 返回空库的干净场景），
+            # 晋升就永久走不到结尾，promote.log 每次都是空的。
+            # 现在用 (|oos_median|, sid, factor) 三元组承载，取值口径不变。
+            weakest = None
             for sid, v in (lib.get("factors") or {}).items():
                 w = abs(v.get("oos_median", 0) or 0)
                 if weakest is None or w < weakest[0]:
-                    weakest_sid, weakest = w, v
-            challenger = passed[0] if passed else None
+                    weakest = (w, sid, v)
+            challenger = passed_new[0] if passed_new else None
             if challenger and weakest and abs(challenger["oos_median"]) > weakest[0] * 1.2:
-                dropped.append({"name": weakest.get("name"),
+                weakest_sid, weakest_v = weakest[1], weakest[2]
+                dropped.append({"name": weakest_v.get("name"),
                                 "reason": f"被更强的新因子 {challenger['name']} 替换",
-                                "oos_median": weakest.get("oos_median")})
+                                "oos_median": weakest_v.get("oos_median")})
                 lib["factors"].pop(weakest_sid, None)
                 room = 1
             else:
-                passed = []
-        for v in passed[room:]:
+                passed_new = []
+        for v in passed_new[room:]:
             dropped.append({"name": v["name"], "reason": "库容量已满，按强度截断",
                             "oos_median": v["oos_median"]})
-        passed = passed[:room]
+        passed_new = passed_new[:room]
+    passed = passed_new + passed_old
 
     promoted_now = []
+    newly = 0
     for v in passed:
         prev = lib["factors"].get(v["spec_id"], {})
+        if not prev:
+            newly += 1
         lib["factors"][v["spec_id"]] = {
             "name": v["name"], "spec": v["spec"],
             # n_sessions 已在上游按「排除纯缓存复用会话」算过，直接写。
             "n_sessions": v["n_sessions"],
             "n_distinct_oos": v.get("n_distinct_oos"),
             "oos_median": v["oos_median"],
+            "icir_median": v.get("icir_median"),
+            "oos_ic_median": v.get("oos_ic_median"),
             "dsr_best": v["dsr_best"], "pbo_best": v["pbo_best"],
             "lf_net_median": v["lf_net_median"],
             "first_promoted": prev.get("first_promoted") or
@@ -476,30 +803,38 @@ def promote(patterns: list[str] | None = None, min_runs: int = 2,
     # 注意：这里存的是**原始**试验数（供审计），DSR 用的是有效试验数 n_cum。
     lib["cumulative_trials"] = og.cumulative_trials()
     lib["redundancy_gate"] = {"max_abs_corr": max_abs_corr, "max_library": max_library,
-                              "n_rejected_redundant": len(redundant)}
+                              "min_abs_icir": min_abs_icir,
+                              "n_rejected_redundant": len(redundant),
+                              "rejected_detail": redundant[:50]}
     lib["trial_accounting"] = trial_detail
     LIB_FILE.parent.mkdir(parents=True, exist_ok=True)
     LIB_FILE.write_text(json.dumps(lib, ensure_ascii=False, indent=2, default=str))
 
     if verbose:
-        print(f"扫描 {len(runs)} 个挖掘结果文件，累计 {len(acc)} 个候选 spec")
+        print(f"扫描 {n_runs} 个挖掘结果文件，累计 {len(acc)} 个候选 spec")
         print(f"试验计数：原始 N={n_raw} → 有效 N={n_cum}"
               f"（{trial_detail.get('n_families')} 个算子族；同族网格变体共享同一信号，"
               f"不计为独立试验）")
         print(f"累计试验数 N={n_cum}；晋升门槛：可重复>={min_runs}次, "
               f"DSR>={dsr_floor}, PBO<={pbo_ceiling}, |OOS中位|>={min_oos_sharpe}, "
-              f"冗余<={max_abs_corr}")
-        print(f"\n本次晋升 {len(promoted_now)} 个，正式库共 {len(lib['factors'])} 个\n")
+              f"|ICIR|>={min_abs_icir}, 冗余<={max_abs_corr}")
+        # promoted_now 里既有新晋的也有"老因子刷新 last_seen"的，混在一起数会误导
+        # （每轮都报"晋升 17 个"而库不变）。分开报。
+        print(f"\n本次新晋 {newly} 个（另有 {len(promoted_now) - newly} 个库内因子刷新），"
+              f"正式库共 {len(lib['factors'])} 个\n")
         for v in verdicts[:15]:
             flag = "🏆晋升" if v["promoted"] else "  "
             c = v["checks"]
             miss = ",".join(k for k, ok in c.items() if not ok)
             print(f"  {flag} {str(v['name'])[:26]:26s} 会话={v['n_sessions']} "
-                  f"OOS中位={v['oos_median']:+.2f} DSR={v['dsr_best']} "
-                  f"PBO={v['pbo_best']}" + (f"  ✗{miss}" if miss else ""))
-    return {"n_runs": len(runs), "n_candidates": len(acc),
-            "n_promoted_now": len(promoted_now), "n_library": len(lib["factors"]),
+                  f"OOS中位={v['oos_median']:+.2f} ICIR={v.get('icir_median')} "
+                  f"DSR={v['dsr_best']} PBO={v['pbo_best']}"
+                  + (f"  ✗{miss}" if miss else ""))
+    return {"n_runs": n_runs, "n_candidates": len(acc),
+            "n_promoted_now": len(promoted_now), "n_newly_promoted": newly,
+            "n_library": len(lib["factors"]),
             "n_rejected_redundant": len(redundant), "redundant": redundant,
+            "n_rejected_unrobust": len(robust_rejected), "unrobust": robust_rejected,
             "dropped": dropped, "verdicts": verdicts}
 
 
@@ -507,14 +842,28 @@ def _main() -> None:
     ap = argparse.ArgumentParser(description="因子晋升闸门（防过拟合）")
     ap.add_argument("--glob", action="append", default=None,
                     help="挖掘结果 glob，可多次指定；默认扫 runs/mine*.json 及 loop 输出")
-    ap.add_argument("--min-runs", type=int, default=2, help="最少独立重复次数")
-    ap.add_argument("--dsr-floor", type=float, default=0.95)
-    ap.add_argument("--pbo-ceiling", type=float, default=0.5)
-    ap.add_argument("--min-oos-sharpe", type=float, default=0.3)
-    ap.add_argument("--max-abs-corr", type=float, default=0.8,
+    ap.add_argument("--min-runs", type=int, default=5, help="最少独立重复次数")
+    ap.add_argument("--dsr-floor", type=float, default=0.999)
+    ap.add_argument("--pbo-ceiling", type=float, default=0.4)
+    ap.add_argument("--min-oos-sharpe", type=float, default=0.6)
+    ap.add_argument("--min-abs-icir", type=float, default=0.09,
+                    help="信号强度门槛：|ICIR| 中位数下限。OOS Sharpe 能被低波动/"
+                         "低换手凑出来，ICIR 不会。<=0 关闭。")
+    ap.add_argument("--min-abs-ic", type=float, default=0.01,
+                    help="IC 方向门槛：|OOS IC| 中位数下限，且符号必须与 spec 的 "
+                         "direction 一致。<=0 关闭。")
+    ap.add_argument("--max-abs-corr", type=float, default=0.6,
                     help="冗余门槛：与库内/已选因子截面rank相关超过此值则拒收；<=0 关闭")
-    ap.add_argument("--max-library", type=int, default=20,
-                    help="库容量上限；0=不限。默认 20：真正的去重靠 --max-abs-corr，"
+    ap.add_argument("--no-robust", action="store_true",
+                    help="关闭跨配置稳健性闸门（默认开启：换持有期/切分后 IC 必须同号）")
+    ap.add_argument("--robust-holds", type=int, nargs="+", default=[1, 5, 20],
+                    help="稳健性检查用的持有期列表")
+    ap.add_argument("--robust-min-consistency", type=float, default=0.66,
+                    help="跨配置 IC 同号比例下限，低于此值拒绝晋升")
+    # 2026-10-26：默认 20 → 60。20 已经升满（实库 18 + 本次待收 17），再往上只剩
+    # 「弱因子互相踢掉」，而真正去重靠的是 --max-abs-corr=0.8，容量只是防无限膨胀的护栏。
+    ap.add_argument("--max-library", type=int, default=60,
+                    help="库容量上限；0=不限。默认 60：真正的去重靠 --max-abs-corr，"
                          "这个容量只是防无限膨胀的护栏。早期默认 5 的推导前提"
                          "（『去冗余后实际只有 3~5 个存活』）并不成立——它会把"
                          "第 6 个全新且正交的好因子静默丢弃，且不报错。")
@@ -523,6 +872,9 @@ def _main() -> None:
     args = ap.parse_args()
     promote(args.glob, min_runs=args.min_runs, dsr_floor=args.dsr_floor,
             pbo_ceiling=args.pbo_ceiling, min_oos_sharpe=args.min_oos_sharpe,
+            min_abs_icir=args.min_abs_icir, min_abs_ic=args.min_abs_ic,
+            robust_check=not args.no_robust, robust_holds=tuple(args.robust_holds),
+            robust_min_consistency=args.robust_min_consistency,
             max_abs_corr=0.0 if args.no_redundancy else args.max_abs_corr,
             max_library=args.max_library, market=args.market)
 

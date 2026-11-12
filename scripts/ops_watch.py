@@ -30,12 +30,23 @@ from pathlib import Path
 
 PROJ = Path(__file__).resolve().parent.parent
 
-SERVICES = ["quant-trader", "quant-trader-resonance", "quant-miner", "y2a-auto"]
+SERVICES = ["quant-trader", "quant-trader-resonance", "y2a-auto"]
+# 挖掘 2026-11-05 迁到深圳机，本机不再有 quant-miner.service（查它是查不到的）；
+# 远程状态见 _sz_miner_state()。留着会每 30 分钟误报一次「服务未运行」。
 DISK_MIN_GB = 2.0
 MEM_MIN_MB = 150
+
+# lowfreq 交易端的回撤熔断线（对应 systemd 的 --max-drawdown-pct 0.10）。
+# 巡检要报「离熔断还有多远」——只报 8.9% 看不出危险，报「距 10% 只剩 1.1pp」
+# 才看得出账户在往哪走。改 unit 参数时这里要同步。
+MAX_DD_PCT = 0.10
 # signal_date 滞后的告警阈值（自然日）。周末面板本来就不推进，留 2 天余量，
 # 再放宽到 4 天：>=4 天说明至少有 1 个交易日没被刷进来。
 SIGNAL_MAX_LAG_DAYS = 4
+# 单个盘口「多久没出过任何信号」的告警阈值（小时）。进程活着、tick 正常、
+# 心跳照写，但策略永远 silent —— 这是巡检看不见的那种静默死亡。
+# 96h 是刻意放宽的：共振盘在 RISK_OFF 里空仓几天属正常，阈值太紧会变噪音。
+BOOK_SILENT_HOURS = 96
 
 
 def _svc_active(name: str) -> bool:
@@ -176,29 +187,99 @@ def _cpu(record: bool = True) -> dict:
 
 
 def _last_trader_tick() -> dict:
-    """从 heartbeat 读最近一次 tick。"""
-    hb = PROJ / "data" / "binance" / "trader_heartbeat.jsonl"
-    if not hb.exists():
-        return {"found": False}
-    try:
-        # 读最后一行
-        with hb.open("rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - 4096))
-            lines = [l for l in f.read().decode(errors="ignore").splitlines() if l.strip()]
-        rec = json.loads(lines[-1])
-        ts = rec.get("ts", "")
-        age = None
+    """从 heartbeat 读最近一次 tick。
+
+    2026-10-23 修：单盘隔离（--book lowfreq / resonance）后，进程把心跳写到
+    data/binance/books/<book>/trader_heartbeat.jsonl，全局路径上的
+    data/binance/trader_heartbeat.jsonl 只剩历史残留、永远不再更新，于是巡检
+    会一直误报「量化 tick 疑似卡死」。这里取**全局 + 所有 book 心跳**里最新的一条；
+    顺手跳过残留的截断/损坏行。
+    """
+    cands = [PROJ / "data" / "binance" / "trader_heartbeat.jsonl"]
+    cands += sorted((PROJ / "data" / "binance" / "books").glob("*/trader_heartbeat.jsonl"))
+
+    best = None
+    best_ts: datetime | None = None
+    for hb in cands:
+        if not hb.exists():
+            continue
         try:
+            with hb.open("rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 4096))
+                lines = [l for l in f.read().decode(errors="ignore").splitlines() if l.strip()]
+            rec = None
+            for line in reversed(lines):
+                try:
+                    rec = json.loads(line)
+                    break
+                except Exception:
+                    continue
+            if not rec:
+                continue
+            ts = rec.get("ts", "")
             t = datetime.fromisoformat(ts)
-            age = (datetime.now(timezone.utc) - t).total_seconds()
         except Exception:
-            pass
-        return {"found": True, "ts": ts, "age_sec": round(age) if age else None,
-                "status": rec.get("status"), "signal_date": rec.get("signal_date")}
-    except Exception as e:
-        return {"found": False, "error": str(e)}
+            continue
+        if best_ts is None or t > best_ts:
+            best_ts, best = t, (hb, rec)
+    if not best:
+        return {"found": False}
+    hb, rec = best
+    age = (datetime.now(timezone.utc) - best_ts).total_seconds()
+    return {"found": True, "ts": rec.get("ts"), "age_sec": round(age),
+            "source": str(hb.relative_to(PROJ)),
+            "status": rec.get("status"), "signal_date": rec.get("signal_date")}
+
+
+# 面板缓存末日陈旧（2026-11-01 加）。挖掘只读缓存面板，不会自己重建：
+#   data/crypto.py 的 load_panel() 纯读 parquet，没有新鲜度检查，
+#   data/crypto 也没有任何刷新 cron（只有美股有 refresh_hist.py）。
+# 实测 crypto 面板停在 2026-10-24 整整 8 天没人发现，后果是连锁的：
+#   - 每轮挖掘都用同一段历史 → data_window_id 不变 → 试验数 N 不涨
+#     （overfit_guard 把这 8 天所有 crypto 会话都判成「同窗口重跑」，n_counted=0）
+#   - 幸存因子全在 8 天前的行情上验证，DSR 的 N 也是死的
+# 巡检原先只看 signal_date（美股那条链路），对 crypto 这条完全无感。
+# 币是 24/7 的，所以阈值给 2 天：留 1 天容错（跨日边界/接口抖动），
+# 超过 2 天必然是没人刷。
+CRYPTO_MAX_LAG_DAYS = 2
+
+
+def _remote_meta(rel: tuple[str, ...]) -> dict:
+    """读深圳机上的面板 meta（只读，失败要显式报错，不能静默当健康）。"""
+    path = "/opt/quant-lab/" + "/".join(rel)
+    r = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "sz",
+         f"cat {path}"],
+        capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError(f"远端读取失败 rc={r.returncode} {r.stderr.strip()[:60]}")
+    return json.loads(r.stdout)
+
+
+def _data_freshness() -> dict:
+    """各市场挖掘面板的末日与滞后天数（只读 meta.json，不碰数据本体）。"""
+    today = datetime.now(timezone.utc).date()
+    out: dict = {}
+    for mkt, rel in (("crypto", ("data", "crypto", "meta.json")),
+                     ("us", ("data", "hist", "meta.json"))):
+        try:
+            # 2026-11-07：挖掘 11-05 迁到深圳机，本机 data/crypto 只是回迁时的
+            # 旧副本、没有任何消费者，也不会再刷新。继续读它会每 30 分钟
+            # 误报一次「加密面板陈旧」。有消费者的是深圳机那份，判据跟过去。
+            if mkt == "crypto":
+                m = _remote_meta(rel)
+            else:
+                m = json.loads((PROJ.joinpath(*rel)).read_text())
+            end = m.get("end")
+            lag = (today - datetime.fromisoformat(str(end)).date()).days if end else None
+            out[mkt] = {"end": end, "lag_days": lag,
+                        "n_symbols": m.get("n_symbols"),
+                        "fetched_at": m.get("fetched_at")}
+        except Exception as e:  # noqa: BLE001
+            out[mkt] = {"error": str(e)[:80]}
+    return out
 
 
 def _signal_staleness(signal_date: str | None) -> dict:
@@ -232,33 +313,176 @@ def _signal_staleness(signal_date: str | None) -> dict:
     return out
 
 
-def _miner_state() -> dict:
-    """当前挖掘轮次 + 是否在跑。"""
-    d: dict = {"running": False}
+# 挖掘一轮的每个阶段是不同的 python 入口，进程名各不相同：
+#   core.mine（挖矿）/ core.promote（晋升闸门）/ core.proposal_pool（提案池，内联 -c）
+#   scripts.pull_news / clean_news / llm_news（新闻链路）
+# 2026-10-31 实测：只匹配 core.mine 时，第 14 轮在跑 proposal_pool 会被报成 running=False，
+# 看着像挖矿挂了。一个正则覆盖全阶段，别再用 ppid 兜底。
+MINER_PROC_RE = (r"core\.(mine|proposal_pool|promote)"
+                 r"|scripts[./](pull_news|clean_news|llm_news)")
+
+
+def _book_silence() -> dict:
+    """每个盘口距「上一次真正出信号」过了多久（小时）。
+
+    2026-11-01 加。共振盘 10-29 20:23 平掉最后一腿后连续 55 小时 silent，
+    心跳正常、tick 正常、巡检全绿 —— 但账户其实已经躺平两天多。
+    silent 本身可能是合理的（RISK_OFF 空仓），所以阈值要足够宽，
+    只在「长期」哑火时才报，避免变成天天叫的噪音。
+
+    口径：取该盘口心跳里最后一条 n_signals>0 或 status 属于
+    executed/no_fill/dry_run 的记录（即真的产出过信号），算到现在的小时数。
+    心跳本身若已陈旧，交给 tick 卡死那条告警，这里不重复报。
+
+    只对「心跳里带 n_signals 字段」的盘生效（目前是共振盘）。lowfreq 是
+    低频调仓盘，心跳只有 executed、没有 n_signals，拿 executed 当信号代理会
+    在正常空仓期误报 —— 这类盘直接跳过，不猜。
+    """
+    out: dict = {}
+    books_dir = PROJ / "data" / "binance" / "books"
+    for hb in sorted(books_dir.glob("*/trader_heartbeat.jsonl")):
+        book = hb.parent.name
+        try:
+            last_sig: datetime | None = None
+            last_ts: datetime | None = None
+            has_nsig = False
+            with hb.open("rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                # 只回读尾部 1MB：够覆盖上千条心跳，不把整份历史读进内存
+                f.seek(max(0, size - 1024 * 1024))
+                for line in f.read().decode(errors="ignore").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        t = datetime.fromisoformat(rec.get("ts", ""))
+                    except Exception:
+                        continue
+                    if "n_signals" in rec:
+                        has_nsig = True
+                    if last_ts is None or t > last_ts:
+                        last_ts = t
+                    if (rec.get("n_signals") or 0) > 0 or rec.get("status") in (
+                            "executed", "no_fill", "dry_run"):
+                        if last_sig is None or t > last_sig:
+                            last_sig = t
+        except Exception:
+            continue
+        if last_ts is None:
+            continue
+        now = datetime.now(timezone.utc)
+        silent_h = (round((now - (last_sig or last_ts)).total_seconds() / 3600.0, 1)
+                    if has_nsig else None)
+        out[book] = {
+            "silent_hours": silent_h,
+            "last_signal": last_sig.isoformat() if last_sig else None,
+            "heartbeat_age_min": round((now - last_ts).total_seconds() / 60.0, 1),
+            "tracked": has_nsig,
+        }
+    return out
+
+
+def _has_proc(pattern: str) -> bool:
+    """有没有 cmdline 命中 pattern 的进程。异常一律当"没在跑"，巡检不该被它带崩。"""
     try:
-        r = subprocess.run(["pgrep", "-f", "core.mine"], capture_output=True,
+        r = subprocess.run(["pgrep", "-f", pattern], capture_output=True,
                            text=True, timeout=10)
-        d["running"] = bool(r.stdout.strip())
+        return bool(r.stdout.strip())
     except Exception:
-        pass
-    # 最近一轮目录
-    dirs = sorted(glob.glob(str(PROJ / "runs" / "loop_*")), reverse=True)
-    if dirs:
-        latest = Path(dirs[0])
-        d["latest_loop"] = latest.name
-        rounds = sorted(latest.glob("round_*"))
-        if rounds:
-            rdir = rounds[-1]
-            d["latest_round"] = rdir.name
-            logs = list(rdir.glob("*.log"))
-            d["round_files"] = [x.name for x in logs]
-            # 抓进度行
-            for lg in logs:
-                txt = lg.read_text(errors="ignore")
-                prog = [l for l in txt.splitlines() if "进度" in l or "幸存" in l]
-                if prog:
-                    d.setdefault("progress", {})[lg.name] = prog[-1].strip()
+        return False
+
+
+def _sz_miner_state() -> dict:
+    """深圳机上挖掘服务的真实状态（2026-11-05 迁移后）。
+
+    本机只做控制面：一次 SSH 只读查询，不在这边跑任何挖掘进程 —— 本机可用
+    内存只剩几百 MB，要留给交易端和视频流水线。查不到 ≠ 挂了：网络不通时
+    必须报「不可达」，不能报「从未运行」，否则两种故障谁也分不清。
+    """
+    d: dict = {"host": "sz", "running": False, "reachable": False}
+    cmd = ("systemctl is-active quant-miner 2>/dev/null; "
+           "ls -1dt /opt/quant-lab/runs/loop_* 2>/dev/null | head -1; "
+           "ls -1d /opt/quant-lab/runs/loop_*/round_* 2>/dev/null | sort -V | tail -1; "
+           "tail -1 /opt/quant-lab/runs/mine_loop.log 2>/dev/null")
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "sz", cmd],
+            capture_output=True, text=True, timeout=40,
+        )
+    except Exception as exc:  # ssh 缺失/超时
+        d["error"] = str(exc)[:160]
+        return d
+
+    lines = (r.stdout or "").splitlines()
+    if not lines or (lines[0].strip() not in ("active", "inactive", "activating",
+                                              "deactivating", "failed")):
+        d["error"] = ((r.stderr or "").strip() or f"rc={r.returncode}")[:160]
+        return d
+
+    d["reachable"] = True
+    d["running"] = lines[0].strip() == "active"
+    if len(lines) > 1 and lines[1].strip():
+        d["latest_loop"] = lines[1].strip().rstrip("/").split("/")[-1]
+    if len(lines) > 2 and lines[2].strip():
+        d["latest_round"] = lines[2].strip().rstrip("/").split("/")[-1]
+    if len(lines) > 3 and lines[3].strip():
+        d["log_tail"] = lines[3].strip()
     return d
+
+
+def _miner_state() -> dict:
+    """兼容旧调用点：现在一律走深圳机。"""
+    return _sz_miner_state()
+
+
+def _mine_channel_health() -> dict:
+    """最近一轮各市场的回测通道是否真的在产出（2026-10-31 加）。
+
+    背景：crypto 通道连续 10+ 轮「幸存 0」，日志看着正常（FDR 每轮过 160+ 条），
+    实际是 `_layer_masks` 的广度门槛 `n >= n_groups*4 = 20` 遇上 17 币宇宙，
+    每个候选的 LS 收益都是空序列 → ls_sharpe=0 / oos_ls_sharpe=NaN → 永远不可能幸存。
+    这类「跑得动但产不出」的哑火，服务状态和日志都看不出来，必须单独盯。
+    """
+    out: dict = {"markets": {}}
+    dirs = sorted(glob.glob(str(PROJ / "runs" / "loop_*")), reverse=True)
+    if not dirs:
+        return out
+    rounds = sorted(Path(dirs[0]).glob("round_*"), reverse=True)
+    if not rounds:
+        return out
+    # 每轮只挖一个市场（us/crypto 交替），所以某个市场的文件可能在上一轮 →
+    # 各自回溯到最近一份，避免只看到当轮那半边。
+    for mkt in ("us", "crypto"):
+        f = None
+        for rdir in rounds:
+            cand = rdir / f"mine_{mkt}.json"
+            if cand.exists():
+                f = cand
+                break
+        if f is None:
+            continue
+        try:
+            d = json.loads(f.read_text())
+        except Exception:
+            continue
+        recs = d.get("all_results") or []
+        valid_oos = sum(
+            1 for r in recs
+            if isinstance(r.get("oos_ls_sharpe"), (int, float))
+            and r["oos_ls_sharpe"] == r["oos_ls_sharpe"]
+        )
+        dw = d.get("data_window") or {}
+        out["markets"][mkt] = {
+            "round": f.parent.name,
+            "n_symbols": dw.get("n_symbols"),
+            "n_backtested": d.get("n_backtested", len(recs)),
+            "n_fdr_pass": d.get("n_fdr_pass", 0),
+            "n_valid_oos": valid_oos,
+            "n_survivors": d.get("n_survivors", 0),
+        }
+    return out
 
 
 def _trial_and_library() -> dict:
@@ -277,21 +501,146 @@ def _trial_and_library() -> dict:
     return out
 
 
-def _risk_recent() -> dict:
-    """扫描最近决策日志，统计风控触发。"""
-    dl = PROJ / "data" / "binance" / "trader_decisions.jsonl"
-    out = {"breakers": {}, "derisk": 0, "drift": 0}
-    if not dl.exists():
-        return out
+def _llm_health() -> dict:
+    """LLM 通路 + 降级状态（2026-10-23 加）。
+
+    两件事分开看，缺一不可：
+      1) reachable：配置里的 base_url 到底通不通。9router 那次被停，端口直接
+         Connection refused，而巡检只看 systemd 服务状态，全绿了一整周。
+      2) n_consecutive_fallback：通了但一直判失败（鉴权/模型名/上游 404）时，
+         交易端会静默走 factor_fallback。取最近几次 LLM 决策的 llm_ok 连着数。
+    只做本地可达性 + 日志统计，**不调模型**（巡检每 30 分钟跑，不能烧 token）。
+    """
+    out = {"reachable": None, "base_url": None, "error": None,
+           "n_consecutive_fallback": 0, "last_llm_ok": None}
     try:
-        lines = dl.read_text(errors="ignore").splitlines()[-50:]
-    except Exception:
-        return out
-    for ln in lines:
+        sys.path.insert(0, str(PROJ))
+        from core import config as qcfg
+        base = (qcfg.LLM_BASE_URL or "").rstrip("/")
+        out["base_url"] = base
+        if os.environ.get("QUANT_LLM_DISABLED", "").strip() == "1":
+            # 挖矿机零 LLM 是设计状态，不是故障：提案由主控机生成后同步过来。
+            # 这里返回 None → 不触发告警，但巡检输出里仍能看到原因。
+            out["reachable"] = None
+            out["error"] = "本机禁用 LLM（QUANT_LLM_DISABLED=1），提案由主控机同步"
+        elif not base:
+            out["reachable"] = False
+            out["error"] = "LLM_BASE_URL 未配置"
+        elif not qcfg.has_llm():
+            out["reachable"] = False
+            out["error"] = "缺少 LLM API KEY"
+        else:
+            from urllib.parse import urlparse
+            import socket
+            u = urlparse(base)
+            host = u.hostname or "127.0.0.1"
+            port = u.port or (443 if u.scheme == "https" else 80)
+            with socket.create_connection((host, port), timeout=3):
+                out["reachable"] = True
+    except Exception as e:  # noqa: BLE001
+        out["reachable"] = False
+        out["error"] = f"{type(e).__name__}: {e}"[:120]
+
+    # 降级连击数：按 ts 取每个 book 最近的 LLM 决策记录
+    books = PROJ / "data" / "binance" / "books"
+    worst = 0
+    for f in sorted(books.glob("*/llm_order_decisions.jsonl")):
         try:
-            r = json.loads(ln)
+            lines = f.read_text(errors="ignore").splitlines()[-8:]
         except Exception:
             continue
+        streak = 0
+        for ln in reversed(lines):
+            try:
+                r = json.loads(ln)
+            except Exception:
+                continue
+            if r.get("llm_ok") is False:
+                streak += 1
+            else:
+                break
+        if out["last_llm_ok"] is None and lines:
+            try:
+                out["last_llm_ok"] = json.loads(lines[-1]).get("llm_ok")
+            except Exception:
+                pass
+        worst = max(worst, streak)
+    out["n_consecutive_fallback"] = worst
+    return out
+
+
+def _exec_rejections(per_book: int = 20) -> dict:
+    """统计各 book 最近的下单失败情况（2026-10-23 加）。
+
+    为什么：`execute_orders` 的失败只写进 decisions 的 results[].status="error"，
+    systemd 看到进程活着就报 active。实测共振盘 10-16 之后 16 笔下单全部
+    -4411（未签 TradFi-Perps 协议），巡检却一直全绿 —— 这属于「静默空转」。
+    """
+    out = {"n_recent_errors": 0, "last_error": None, "by_book": {}}
+    books = PROJ / "data" / "binance" / "books"
+    for f in sorted(books.glob("*/trader_decisions.jsonl")):
+        try:
+            lines = f.read_text(errors="ignore").splitlines()[-per_book:]
+        except Exception:
+            continue
+        n_err = 0
+        last = None
+        # 只看**最近一次执行之后**的失败：签约/充值修好后，历史错误不该一直挂着报警，
+        # 否则告警会变成永久噪音，人就又看不见新问题了。
+        last_ok_ts = None
+        for ln in lines:
+            try:
+                rr = json.loads(ln)
+            except Exception:
+                continue
+            if any((x or {}).get("status") == "sent" for x in (rr.get("results") or [])):
+                last_ok_ts = rr.get("ts")
+        for ln in lines:
+            try:
+                r = json.loads(ln)
+            except Exception:
+                continue
+            if last_ok_ts and (r.get("ts") or "") <= last_ok_ts:
+                continue
+            for res in (r.get("results") or []):
+                if res.get("status") == "error":
+                    n_err += 1
+                    last = (res.get("error") or "")[:90]
+        if n_err:
+            out["by_book"][f.parent.name] = n_err
+            out["n_recent_errors"] += n_err
+            out["last_error"] = last or out["last_error"]
+    return out
+
+
+def _risk_recent() -> dict:
+    """扫描最近决策日志，统计风控触发。
+
+    分账本后每个盘写自己的 ``data/binance/books/<book>/trader_decisions.jsonl``，
+    根目录那份 ``data/binance/trader_decisions.jsonl`` 从 2026-10-23 起就停写了。
+    只读根目录会拿 6 天前的旧记录当"当前风控"，所以这里把所有来源合并按 ts 取最近 50 条。
+    """
+    out = {"breakers": {}, "derisk": 0, "drift": 0,
+           "drawdown_alert": 0, "dd_loss_pct": None, "dd_books": {},
+           "dd_latest": None, "dd_breach_no_derisk": 0}
+    files = [PROJ / "data" / "binance" / "trader_decisions.jsonl"]
+    files += sorted(glob.glob(str(PROJ / "data" / "binance" / "books" / "*" / "trader_decisions.jsonl")))
+    recs = []
+    for fp in files:
+        try:
+            lines = Path(fp).read_text(errors="ignore").splitlines()[-50:]
+        except Exception:
+            continue
+        book = Path(fp).parent.name if Path(fp).parent.name != "binance" else "root"
+        for ln in lines:
+            try:
+                r = json.loads(ln)
+            except Exception:
+                continue
+            r["_book"] = book
+            recs.append(r)
+    recs.sort(key=lambda r: str(r.get("ts") or ""))
+    for r in recs[-50:]:
         g = r.get("guard") or {}
         for b in (g.get("blocks") or []):
             key = b.split("(")[0]
@@ -300,6 +649,29 @@ def _risk_recent() -> dict:
             out["derisk"] += 1
         if r.get("reconcile_drift"):
             out["drift"] += 1
+        if "drawdown_alert" in (r.get("trigger_reasons") or []):
+            out["drawdown_alert"] += 1
+            bk = r.get("_book") or "?"
+            out["dd_books"][bk] = out["dd_books"].get(bk, 0) + 1
+            lp = (((r.get("trigger_evidence") or {}).get("drawdown_alert") or {})
+                  .get("loss_pct"))
+            if isinstance(lp, (int, float)):
+                lp = abs(lp)
+                out["dd_loss_pct"] = max(out["dd_loss_pct"] or 0.0, lp)
+        # 熔断线越线但降险空转（2026-11-01 加，同日已修 force_derisk）：
+        # 当时 lowfreq 浮亏 -10.95% 已过 10% 熔断线，但 force_derisk 的目标敞口
+        # = gross_cap*equity*(1-dd) ≈ 107U > 实际 gross 56.6U，直接返回空单；
+        # 唯一生成的 GOOGL 平仓单只有 2.82U，被 5U 最小名义额挡下。
+        # 结果：熔断「触发了」却一腿没减。只看 breakers 计数完全看不出来。
+        # 修复后目标改为 min(仓位上限, 当前敞口)*(1-dd)，且比例微调被最小名义额
+        # 挡住时整腿平仓兜底 —— 这条告警仍保留，作为「修完又坏掉」的哨兵。
+        eq = r.get("equity")
+        upnl = r.get("unrealized_pnl")
+        if isinstance(eq, (int, float)) and eq > 0 and isinstance(upnl, (int, float)) and upnl < 0:
+            lp_now = -upnl / eq
+            out["dd_latest"] = max(out["dd_latest"] or 0.0, lp_now)
+            if lp_now >= 0.10 and not g.get("active_derisk"):
+                out["dd_breach_no_derisk"] += 1
     return out
 
 
@@ -314,7 +686,9 @@ def snapshot() -> dict:
     risk = _risk_recent()
 
     for s, d in svcs.items():
-        if not d.get("active"):
+        # y2a-auto 属另一条线，由它自己的服务守护；按计划停机期间不重复告警。
+        # 2026-11-07：否则每 30 分钟一条固定噪音，会把真正的静默停摆淹掉。
+        if not d.get("active") and s != "y2a-auto":
             alerts.append(f"服务未运行: {s}")
     if mem.get("avail_mb", 9999) < MEM_MIN_MB:
         alerts.append(f"内存紧张: 可用 {mem.get('avail_mb')}MB < {MEM_MIN_MB}MB")
@@ -329,24 +703,93 @@ def snapshot() -> dict:
         alerts.append(f"因子信号陈旧: signal_date={tick.get('signal_date')}，"
                       f"已滞后 {stale['lag_days']} 个自然日（面板末日 "
                       f"{stale.get('panel_end')}）→ 跑 scripts/refresh_hist.py")
-    if not miner.get("running") and not miner.get("latest_loop"):
-        alerts.append("挖掘进程从未运行")
+    if not miner.get("reachable"):
+        alerts.append(f"深圳机挖掘状态未知（SSH 不可达：{miner.get('error', '?')}）")
+    elif not miner.get("running"):
+        alerts.append("深圳机挖掘服务未运行（quant-miner 非 active）")
     if risk.get("drift"):
         alerts.append(f"近 {risk['drift']} 次 tick 有持仓漂移")
     if risk["breakers"].get("max_drawdown_breaker"):
         alerts.append(f"近 50 次决策触发回撤熔断 {risk['breakers']['max_drawdown_breaker']} 次")
     if risk["breakers"].get("daily_loss_breaker"):
         alerts.append(f"近 50 次决策触发日内亏损熔断 {risk['breakers']['daily_loss_breaker']} 次")
+    # 回撤警戒（未到熔断线）：熔断前这段最容易「服务全绿但账户在流血」，
+    # 2026-10-30 实测 lowfreq 未实现回撤 -7.9%/equity100，闸门每 tick 触发但无单可发。
+    if risk.get("drawdown_alert", 0) >= 3:
+        _dd = risk.get("dd_loss_pct") or 0.0
+        _head = MAX_DD_PCT * 100 - _dd
+        _head_s = (f"，距 {MAX_DD_PCT*100:.0f}% 熔断线仅剩 {_head:.2f}pp"
+                   if _head > 0 else "，已越熔断线")
+        alerts.append(f"近 50 次决策回撤警戒 {risk['drawdown_alert']} 次"
+                      f"（盘={risk.get('dd_books')}，最大回撤 {risk.get('dd_loss_pct')}%"
+                      f"{_head_s}）")
+    # 已越 10% 熔断线、但一次主动降险单都没产出（2026-11-01 加）。
+    # 这类空转比「触发熔断」更危险：breakers 计数是 0，看着像没事。
+    if risk.get("dd_breach_no_derisk", 0) >= 1:
+        alerts.append(f"浮亏已越 10% 熔断线（最新 {risk['dd_latest']*100:.2f}%），"
+                      f"但近 50 次决策无一产出主动降险单 → force_derisk 空转，需人工处理")
+    # 下单被交易所拒绝（如 -4411 未签 TradFi-Perps 协议）：进程活着、日志全绿，
+    # 但一单都成交不了。共振盘从 10-16 起就一直这样空转。
+    rej = _exec_rejections()
+    if rej.get("n_recent_errors", 0) >= 3:
+        alerts.append(f"下单连续失败: 最近 {rej['n_recent_errors']} 笔被交易所拒绝"
+                      f"（{rej.get('last_error')}）")
+    # LLM 通路健康（2026-10-23 加）：LLM 挂了交易端会静默降级成纯脚本订单，
+    # 而 9router 之前被停过一次导致整周 llm_unavailable，巡检却全绿。
+    llm = _llm_health()
+    if llm.get("reachable") is False:
+        alerts.append(f"LLM 通路不通: {llm.get('base_url')} —— {llm.get('error')}")
+    elif llm.get("n_consecutive_fallback", 0) >= 2:
+        alerts.append(f"LLM 连续 {llm['n_consecutive_fallback']} 次降级"
+                      f"（order_source=factor_fallback）")
+
+    # 挖掘通道哑火（2026-10-31 加）：日志正常、FDR 有通过，但 OOS 回测全是空的，
+    # 说明广度门槛/掩码把整个市场判死了，再跑多少轮都不可能出幸存。
+    mch = _mine_channel_health()
+    for mkt, h in (mch.get("markets") or {}).items():
+        if h.get("n_fdr_pass", 0) >= 20 and h.get("n_valid_oos", 0) == 0:
+            alerts.append(
+                f"挖掘通道哑火: {mkt} 最近一轮 FDR 通过 {h['n_fdr_pass']} 条但 "
+                f"OOS 回测 0 条有效（宇宙 {h.get('n_symbols')} 只）→ 广度门槛卡死")
+
+    # 面板缓存陈旧（2026-11-01 加）：见 _data_freshness 上方的注释。
+    # 只对 crypto 告警（24/7 市场，滞后 2 天必是没人刷）；美股由
+    # _signal_staleness 那条按交易日判定，周末自然不推进，不在这里重复报。
+    fresh = _data_freshness()
+    c = fresh.get("crypto") or {}
+    if c.get("error"):
+        alerts.append(f"加密面板远端不可达: {c['error']}")
+    elif c.get("lag_days") is not None and c["lag_days"] >= CRYPTO_MAX_LAG_DAYS:
+        alerts.append(
+            f"加密面板陈旧: 末日 {c.get('end')}，已滞后 {c['lag_days']} 天"
+            f"（{c.get('n_symbols')} 只）→ 深圳机 data/crypto 刷新 cron 没跑，"
+            f"挖掘会一直用同一窗口，试验数 N 不涨；"
+            f"跑 venv/bin/python -c \"from data import crypto; crypto.build_panel(force=True, days=2200)\"")
+
+    # 盘口长期无信号（2026-11-01 加）：进程活着、心跳照写、tick 正常，
+    # 但策略连续几天一条信号都没出 —— 巡检原本对这种情况完全无感。
+    sil = _book_silence()
+    for book, s in sil.items():
+        if s.get("silent_hours") is not None and s["silent_hours"] >= BOOK_SILENT_HOURS:
+            alerts.append(
+                f"盘口长期无信号: {book} 已 {s['silent_hours']}h 未出过任何信号"
+                f"（上次 {s.get('last_signal')}，心跳 {s['heartbeat_age_min']}min 前）"
+                f" → 查策略阈值/行情是否已不适合该盘")
 
     return {
         "ts": datetime.now(timezone.utc).isoformat(),
         "healthy": not alerts,
         "alerts": alerts,
+        "book_silence": sil,
         "services": {s: d.get("active") for s, d in svcs.items()},
         "service_details": svcs,
         "mem": mem, "disk": disk,
         "trader_last_tick": tick,
         "miner": miner,
+        "mine_channels": mch,
+        "data_freshness": fresh,
+        "llm_health": llm,
+        "exec_rejections": rej,
         "trials": tl,
         "risk_recent": risk,
     }
@@ -364,18 +807,50 @@ def _render(rep: dict) -> str:
     t = rep["trader_last_tick"]
     if t.get("found"):
         L.append(f"量化: 最近 tick {t['age_sec']}s 前, status={t.get('status')}")
+    for book, s in (rep.get("book_silence") or {}).items():
+        if s.get("silent_hours") is None:
+            L.append(f"       盘口[{book}]: 心跳无 n_signals 字段，不跟踪沉寂")
+        else:
+            L.append(f"       盘口[{book}]: 距上次出信号 {s['silent_hours']}h"
+                     f" | 心跳 {s['heartbeat_age_min']}min 前")
     mn = rep["miner"]
-    L.append(f"挖掘: running={mn.get('running')} loop={mn.get('latest_loop')} "
+    L.append(f"挖掘: host={mn.get('host')} reachable={mn.get('reachable')} "
+             f"running={mn.get('running')} loop={mn.get('latest_loop')} "
              f"round={mn.get('latest_round')}")
+    if mn.get("log_tail"):
+        L.append(f"       最近一行: {mn['log_tail']}")
     for k, v in (mn.get("progress") or {}).items():
         L.append(f"       {k}: {v}")
+    for mkt, h in ((rep.get("mine_channels") or {}).get("markets") or {}).items():
+        L.append(f"       通道[{mkt}]: 候选 {h.get('n_backtested')} | FDR过 {h.get('n_fdr_pass')}"
+                 f" | OOS有效 {h.get('n_valid_oos')} | 幸存 {h.get('n_survivors')}"
+                 f" | 宇宙 {h.get('n_symbols')} 只")
+    fr = rep.get("data_freshness") or {}
+    if fr:
+        L.append("面板: " + " | ".join(
+            f"{k} 末日 {v.get('end')}(滞后 {v.get('lag_days')}d, {v.get('n_symbols')}只)"
+            if v.get("end") else f"{k} 读取失败"
+            for k, v in fr.items()))
     tl = rep["trials"]
     L.append(f"因子库: 累计试验 N={tl.get('cumulative_trials')} "
              f"会话={tl.get('n_sessions')} 正式因子={tl.get('library_factors')}")
+    lh = rep.get("llm_health") or {}
+    if lh:
+        L.append(f"LLM: base={lh.get('base_url')} reachable={lh.get('reachable')} "
+                 f"连续降级={lh.get('n_consecutive_fallback')}")
     r = rep["risk_recent"]
-    if r.get("breakers") or r.get("derisk") or r.get("drift"):
+    if (r.get("breakers") or r.get("derisk") or r.get("drift")
+            or r.get("drawdown_alert")):
+        _dd = r.get("dd_loss_pct")
+        _head = ""
+        if isinstance(_dd, (int, float)):
+            _gap = MAX_DD_PCT * 100 - _dd
+            _head = (f" 距熔断{_gap:.2f}pp" if _gap > 0
+                     else f" 已越熔断{-_gap:.2f}pp")
         L.append(f"风控(近50决策): breakers={r.get('breakers')} "
-                 f"降险={r.get('derisk')} 漂移={r.get('drift')}")
+                 f"降险={r.get('derisk')} 漂移={r.get('drift')} "
+                 f"回撤警戒={r.get('drawdown_alert')}"
+                 f"({_dd}% {r.get('dd_books')}{_head})")
     if rep["alerts"]:
         L.append("告警:")
         for a in rep["alerts"]:

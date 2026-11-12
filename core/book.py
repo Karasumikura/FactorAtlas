@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -84,6 +85,11 @@ def pos_path(book: str | None = None) -> Path:
     return _book_dir(normalize(book)) / "book_positions.json"
 
 
+def _book_ledger_path(book: str | None = None) -> Path:
+    """某盘的成交账（demo_exec_ledger.jsonl）。"""
+    return _book_dir(normalize(book)) / "demo_exec_ledger.jsonl"
+
+
 def load_book_positions(book: str | None = None) -> dict[str, float]:
     """读某盘自有持仓账（{binance_symbol: signed_qty}）。不存在则空。"""
     import json
@@ -113,6 +119,161 @@ def apply_book_fills(fills: list[dict], book: str | None = None) -> dict[str, fl
             pos.pop(sym, None)
     save_book_positions(pos, book)
     return pos
+
+
+def _book_avg_price(book: str | None, sym: str, cur: dict[str, float]) -> float | None:
+    """从本盘成交台账推当前持仓的移动平均成本（只在交易所查不到该标的时兜底用）。
+
+    比「直接按 qty 加权」严谨的地方：处理**反手**——当一笔成交把旧方向打穿、
+    净仓翻到反向时，已实现掉旧仓，成本重置为新开仓价，而不是把多空两边的
+    价格混在一起平均（那样算出来的均价毫无意义）。
+    """
+    p = _book_ledger_path(book)
+    if not p.exists():
+        return None
+    net = 0.0
+    avg = 0.0
+    try:
+        for line in p.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            if r.get("symbol") != sym:
+                continue
+            # 兼容带 status 字段的成交账（只认真发出去的）
+            if "status" in r and r.get("status") != "sent":
+                continue
+            q = float(r.get("qty") or r.get("signed_qty") or 0)
+            px = float(r.get("ref_price") or r.get("price") or r.get("avg_price") or 0)
+            if q <= 0 or px <= 0:
+                continue
+            side = r.get("side")
+            if side:
+                signed = q if side == "BUY" else -q
+            else:
+                signed = float(r.get("signed_qty") or 0)
+                q = abs(signed)
+            if net == 0 or (net > 0) == (signed > 0):
+                avg = (avg * abs(net) + px * q) / (abs(net) + q)
+            else:                       # 反手：已实现掉旧仓，成本重置为新开仓价
+                if abs(signed) >= abs(net):
+                    avg = px
+            net += signed
+    except Exception:  # noqa: BLE001
+        return None
+    return avg if abs(net) > 1e-12 else None
+
+
+def book_unrealized(
+    book: str | None,
+    cur: dict[str, float],
+    prices: dict[str, float] | None = None,
+    testnet: bool = True,
+) -> tuple[float, str]:
+    """算【本盘自有持仓】的浮盈 —— 绝不取账户合计。
+
+    为什么不能取 totalUnrealizedProfit
+    ==================================
+    单账户多盘（见 book.py 设计说明）：交易所里是**合计持仓**。
+    若某盘直接读 `account_summary()["totalUnrealizedProfit"]`，
+    就把别的盘、甚至是台账之外的历史老仓的浮盈全算成自己的：
+
+      2026-10-23 实测：全账户 -2.1586，共振盘自有 4 标的只 -0.2533。
+      低频盘推送的 -2.1252 实际是全账户数，与共振盘重复计量。
+
+    正确口径：按**本盘台账**（book_positions.json）的持仓，逐个取交易所
+    `/fapi/v2/positionRisk` 的 unRealizedProfit 后求和。台账里没有的标的一律不算。
+    查不到某标的时的兜底顺序：本盘成交账算均价 → 用 prices 计价。
+
+    Returns:
+        (unrealized, source)  source ∈ {"book_slice", "book_slice_fallback"}
+    """
+    from core.book import load_book_positions
+    unrealized = 0.0
+    fallback = False
+    if not cur:
+        return 0.0, "book_slice"
+    try:
+        from core.binance_exec import BinanceExec as _BE
+        _ac = _BE.from_env(testnet=testnet, book=book)   # 按账本选账户
+        upnl: dict[str, float] = {}
+        for p in _ac.positions():
+            # 币安 positionRisk 字段名是大写 R 的 unRealizedProfit
+            v = p.get("unRealizedProfit", p.get("unrealizedProfit"))
+            upnl[p["symbol"]] = float(v or 0.0)
+    except Exception:  # noqa: BLE001
+        upnl = {}
+
+    px = prices or {}
+    for sym, q in cur.items():
+        if abs(float(q)) < 1e-12:
+            continue
+        if sym in upnl:
+            unrealized += upnl[sym]
+            continue
+        # 交易所查不到该标的 → 用本盘成交均价 + 现价兜底
+        fallback = True
+        live_px = px.get(sym)
+        avg = _book_avg_price(book, sym, cur)
+        if live_px and avg:
+            unrealized += (float(live_px) - avg) * float(q)
+    return unrealized, ("book_slice_fallback" if fallback else "book_slice")
+
+
+def book_position_side(book: str | None = None, client=None) -> str:
+    """某盘固定使用的 positionSide —— 返回**真实生效**的值。
+
+    赛马设计（2026-10-23）
+    =====================
+    两个策略要独立成立、互不干扰，但单向模式下同一标的是**一根净仓**：
+    A 盘想做多、B 盘想做空，谁后下单谁就把对方平掉 —— 实测 CRCLUSDT
+    在 10-22 16:22 ~ 10-23 03:25 被两个盘来回 flip 了 8 次。
+
+    解法：切双向持仓模式（Hedge Mode），每个盘固定占一个方向腿，
+    各自的下单只碰自己那条腿，永远不平掉别人的仓。
+
+    映射规则（可用环境变量覆盖，例如 QUANT_SIDE_LOWFREQ=SHORT）：
+        lowfreq   → LONG
+        resonance → SHORT
+
+    单向模式下本函数的值会被 execute_orders 忽略（币安只认 BOTH）。
+
+    记账修复（2026-11-05）
+    =====================
+    实测该 Demo 账户 ``dualSidePosition = False``（单向模式），交易所把所有
+    持仓强制成 ``positionSide=BOTH``。但旧代码无条件把 book_position_side()
+    的 "SHORT" 写进台账，导致共振盘 376 笔全记 SHORT、实际全是 BOTH 多头，
+    排查时被这个假标签误导了一轮。
+
+    现在：传了 client 就查真实持仓模式——
+      · 双向模式 → 返回映射腿（LONG/SHORT），与下单行为一致；
+      · 单向模式 → 返回 "BOTH"（交易所真实生效值）。
+    不传 client 时保持旧行为（仅映射），保持向后兼容。
+    """
+    b = normalize(book) or "lowfreq"
+    env = os.environ.get(f"QUANT_SIDE_{b.upper()}")
+    if env:
+        s = env.strip().upper()
+        mapped = s if s in ("LONG", "SHORT") else _DEFAULT_SIDE.get(b, "LONG")
+    else:
+        mapped = _DEFAULT_SIDE.get(b, "LONG")
+    if client is not None:
+        try:
+            if not client.dual_position_mode():
+                return "BOTH"
+        except Exception:  # noqa: BLE001  查不到就按映射值，不影响下单
+            pass
+    return mapped
+
+
+_DEFAULT_SIDE = {
+    "lowfreq": "LONG",
+    "resonance": "SHORT",
+}
 
 
 def save_book_positions(pos: dict[str, float], book: str | None = None) -> None:

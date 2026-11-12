@@ -28,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from factors.engine import OP_DOC, OPS
 from llm.client import chat, extract_json
 
-MAX_LLM_CONCURRENCY = max(1, int(os.environ.get("QUANT_MAX_LLM_CONCURRENCY", "4")))
+MAX_LLM_CONCURRENCY = max(1, int(os.environ.get("QUANT_MAX_LLM_CONCURRENCY", "1")))
 
 
 COMBINE_OPS = "add, sub, mul, div, rank_add, rank_sub, rank_mul, neg, abs"
@@ -311,7 +311,8 @@ def _one_call(seed: str, n: int, tried_names: list[str], temperature: float) -> 
 请提出 {n} 个复合因子，只输出 JSON 数组（嵌套 expr 结构）。"""
     try:
         raw = chat([{"role": "system", "content": SYSTEM.replace("{n}", str(n))},
-                    {"role": "user", "content": user}], temperature=temperature)
+                    {"role": "user", "content": user}], temperature=temperature,
+                   retries=1)
         data = extract_json(raw)
         if isinstance(data, dict):
             data = [data]

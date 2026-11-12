@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# 量化运营巡检（每 30 分钟）—— 预设自愈 + 只读审计，安静模式
+# 2026-11-07 改动：移除第二层 LLM 自愈（core/self_repair --apply）。
+#   它跑 `pytest tests -q` 全库回归；本机 2 核、可用内存常年 <500MB，
+#   全量 pytest 会 OOM 杀掉网关。且它允许改 core/ 白名单文件，会覆盖人工修复。
+#   现在复用 scripts/ops_watch.py 的只读审计（心跳新鲜度 / 成交密度 /
+#   下单被拒 / LLM 通路 / 盘口沉寂），只有不健康时才输出并推 QQ。
+set -uo pipefail
+cd /opt/quant-lab
+
+PY=/opt/quant-lab/venv/bin/python
+HERMES=/root/.hermes/hermes-agent/.hermes/bin/hermes
+TARGET=qqbot:9AA889C7B4FFA2D0F90BC46F6A21B9C6
+
+# 第一层：预设自愈（只重启挂掉的交易服务、清超期 ops 日志）
+OUT=$($PY -m scripts.ops_loop --once 2>&1)
+if echo "$OUT" | grep -qE "⚠️|actions=\[.{2,}"; then
+    echo "$OUT"
+fi
+
+# 第二层：只读健康审计
+AUDIT=$($PY -m scripts.ops_watch 2>&1)
+RC=$?
+if [ "$RC" -ne 0 ]; then
+    echo "── 巡检告警 ──"
+    echo "$AUDIT"
+    HERMES_HOME=/root/.hermes/profiles/pro-analysis \
+        "$HERMES" send --to "$TARGET" "⚠️ 量化巡检告警
+$AUDIT" || true
+fi

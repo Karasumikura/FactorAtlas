@@ -13,6 +13,11 @@ from pathlib import Path
 
 ALERT_LOG = Path(__file__).resolve().parent.parent / "data" / "binance" / "trader_alerts.jsonl"
 
+#: 盈亏百分比的换算基数（USDT）。按用户要求固定为 100 美元本金：实际钱包余额
+#: 约 5009 USDT，若拿它做分母，7 美元的亏损只会显示 -0.142%，把真实风险
+#: 压成了噪声。固定 100 后，-7.1126 USDT 直接读作 -7.11%。
+PNL_PCT_DENOMINATOR = 100.0
+
 
 def _fmt_orders(orders: list[dict]) -> str:
     lines = []
@@ -51,13 +56,30 @@ def _book_label(rec: dict) -> str:
 
 
 def _fmt_pnl(rec: dict) -> str:
-    """浮盈显示：缺失/报错时明确说出来，小金额保留 4 位，别把 0.003 显示成 +0.00。"""
+    """浮盈显示：缺失/报错时明确说出来，小金额保留 4 位，别把 0.003 显示成 +0.00。
+
+    赛马起算（2026-10-23）：显示「起算以来」的浮盈（已减去 base 零轴），
+    括号里保留真实浮盈，兼顾可比性与可复核性。
+    """
     v = rec.get("unrealized_pnl")
     if v is None:
         why = rec.get("account_error")
         return f"未知（账户读取失败: {why[:60]}）" if why else "未知（未计算）"
     v = float(v)
-    return f"{v:+.4f} USDT" if abs(v) < 1 else f"{v:+.2f} USDT"
+    base = 0.0
+    try:
+        from core.race_baseline import baseline_of
+        base = baseline_of(rec.get("book") or "")
+    except Exception:  # noqa: BLE001
+        base = 0.0
+    since = round(v - base, 6)
+
+    def fmt(x: float) -> str:
+        return f"{x:+.4f} USDT" if abs(x) < 100 else f"{x:+.2f} USDT"
+
+    if base:
+        return fmt(since)
+    return fmt(since)
 
 
 def build_message(rec: dict) -> str:
@@ -106,8 +128,60 @@ def build_message(rec: dict) -> str:
         _fmt_positions(rec.get("current_positions", {})),
         "",
         f"钱包浮盈: {_fmt_pnl(rec)}",
+        *_fmt_total_pnl(rec),
     ]
     return "\n".join(lines)
+
+
+def _fmt_total_pnl(rec: dict) -> list[str]:
+    """总盈亏 + 已实现（只读展示，不改任何交易逻辑）。
+
+    为什么加（2026-10-26 用户要求）：原先只显示「钱包浮盈」= 未平仓浮动盈亏，
+    不等于赚了多少钱。用户明确要「浮盈和总盈亏」两个都看。
+      总盈亏   = 当前净值 - 起算净值（已含手续费，是真账）
+      已实现   = 总盈亏 - 当前浮盈（平仓落袋部分，含手续费）
+
+    口径修复（2026-11-01）：原实现用 ``wallet - base_w``，漏掉了起算那一刻
+    账户本来就有的浮盈。lowfreq 的 baseline_unrealized = -2.1643，于是每多亏
+    一块钱就被错记成「已实现赚一块钱」——实测推送里浮亏 -7.20 却显示
+    「已实现 +6.99」，纯虚构。正确做法是两边都换成**净值**：
+      净值 = 钱包余额 + 未实现盈亏
+      起算净值 = 起算钱包 + 起算时未实现盈亏
+    这样浮盈的增减不会再被误记成已实现。
+
+    分母口径（2026-10-27 用户纠正）：固定为 100 USDT 本金，**不是**账户
+    实际钱包余额（≈5000）。历史实现用 ``base_w`` 做分母，7 美元的亏损只显示
+    成 -0.142%，看起来几乎没在亏，掩盖了真实风险。
+    """
+    book = rec.get("book") or ""
+    try:
+        from core.binance_exec import BinanceExec
+        from core.race_baseline import info as _binfo
+        c = BinanceExec.from_env(testnet=True, book=book or None)
+        c.ping()
+        s = c.account_summary()
+        wallet = float(s.get("totalWalletBalance") or 0)
+        acct_unreal = float(s.get("totalUnrealizedProfit") or 0)
+        unreal = rec.get("unrealized_pnl")
+        unreal = float(unreal) if isinstance(unreal, (int, float)) else None
+        bi = _binfo(book)
+        base_w = bi.get("wallet")
+        if base_w is None:
+            return ["总盈亏: 未知（无起算基准）"]
+        base_w = float(base_w)
+        base_u = float(bi.get("baseline_unrealized") or 0.0)
+        nav_now = wallet + acct_unreal
+        nav_base = base_w + base_u
+        total = nav_now - nav_base
+        pct = total / PNL_PCT_DENOMINATOR * 100
+        out = [f"总盈亏: {total:+.4f} USDT ({pct:+.2f}%)"]
+        if unreal is not None:
+            realized = total - unreal
+            rpct = realized / PNL_PCT_DENOMINATOR * 100
+            out.append(f"已实现: {realized:+.4f} USDT ({rpct:+.2f}%)")
+        return out
+    except Exception as e:  # noqa: BLE001
+        return [f"总盈亏: 未知（{type(e).__name__}: {str(e)[:40]}）"]
 
 
 def notify(rec: dict, target: str = "qqbot", quiet: bool = False) -> bool:

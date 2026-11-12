@@ -97,6 +97,7 @@ def mine(panel: dict, llm_total: int = 300, concurrency: int = 16,
          market: str = "us",
          use_cache: bool = True,
          proposal_pool: list[dict] | None = None,
+         evolve_n: int = 0, evolve_gens: int = 3,
          out_json: Path | None = None, verbose: bool = True) -> dict:
     all_specs: list[dict] = []
     seen: set[str] = set()
@@ -120,7 +121,12 @@ def mine(panel: dict, llm_total: int = 300, concurrency: int = 16,
     # A) 系统扫描
     if do_sweep:
         if verbose: print("\n[A] 系统扫描全算子空间...", flush=True)
-        add(generate_grid(), "sweep")
+        grid = generate_grid()
+        # SEC EDGAR 事件因子在加密面板上恒为 0（无申报主体），
+        # 放进去只会给 FDR 池塞常数候选、抬高所有人的门槛。
+        if market == "crypto":
+            grid = [s for s in grid if not str(s.get("op", "")).startswith("edgar_")]
+        add(grid, "sweep")
 
     # B) 经典复合因子
     if do_classic:
@@ -165,6 +171,26 @@ def mine(panel: dict, llm_total: int = 300, concurrency: int = 16,
         except Exception as e:
             if verbose: print(f"  [D] 复合提案失败: {e}", flush=True)
 
+    # E) 程序化进化搜索（无 LLM）——网格 + 提案池是「撒一次网」，
+    #    这里补上「假设(IS 适应度) → 变异/交叉 → 再评估」的闭环结构。
+    #    产出的候选并入上面同一个 all_specs，后续统一走 FDR/OOS，
+    #    由 promote 统一记 N，本阶段不判幸存。
+    if evolve_n > 0:
+        if verbose:
+            print(f"\n[E] 程序化进化搜索（{evolve_gens} 代，种群 {evolve_n}）...",
+                  flush=True)
+        try:
+            from core.evolution import evolve
+            from core.rejection_memory import load_constraints
+            evo = evolve(panel, hold=hold, train_frac=train_frac,
+                         generations=evolve_gens, pop_size=evolve_n,
+                         seed_specs=all_specs[-40:],
+                         avoid=load_constraints(), verbose=verbose)
+            add(evo, "evolution")
+        except Exception as e:  # noqa: BLE001
+            if verbose:
+                print(f"  [E] 进化搜索异常（不影响主流程）: {e}", flush=True)
+
     # 可选：正交筛选（只保留与趋势簇低相关的候选）
     if orthogonal_only:
         from core.orthogonal import select_orthogonal, cluster_for
@@ -195,9 +221,7 @@ def mine(panel: dict, llm_total: int = 300, concurrency: int = 16,
             if not prev:
                 continue
             try:
-                ok = (prev.get("panel_end") == panel_end
-                      and prev.get("hold") == hold
-                      and isinstance(prev.get("result"), dict))
+                ok = zoo_mod.reusable(prev, panel_end, hold)
             except Exception:
                 ok = False
             if ok:
@@ -543,13 +567,6 @@ def mine(panel: dict, llm_total: int = 300, concurrency: int = 16,
                 print(f"  [PBO] 计算失败: {e}", flush=True)
 
     # 登记本次会话，累计试验数
-    try:
-        from core import overfit_guard as og
-        og.record_session(n_candidates=len(results), n_survivors=len(survivors),
-                          market=market, note="core.mine run")
-    except Exception:
-        pass
-
     # 数据窗口指纹（2026-10 加入）。
     # 为什么需要：晋升闸门用 n_sessions 做「跨会话可重复性」判据，但原先
     # mine 结果不记录用的是哪段数据。实测 mom_n250_skip20 出现 46 次、
@@ -569,14 +586,26 @@ def mine(panel: dict, llm_total: int = 300, concurrency: int = 16,
         }
     except Exception:
         pass
+    _win_id = (f"{_win.get('data_start')}..{_win.get('data_end')}"
+               f"|{_win.get('n_dates')}d|{_win.get('n_symbols')}s"
+               if _win else None)
+
+    # 同一数据窗口内，候选由固定网格(sweep)+LLM 提案构成，重跑时集合几乎逐位
+    # 相同（本轮 463 个里 369 个直接命中 zoo 缓存、真正重算 0 个）。带上窗口指纹，
+    # overfit_guard.record_session 就会跳过重复窗口，不再让试验数 N 虚涨。
+    og_extra = {"data_window_id": _win_id} if _win_id else {}
+    try:
+        from core import overfit_guard as og
+        og.record_session(n_candidates=len(results), n_survivors=len(survivors),
+                          market=market, note="core.mine run", extra=og_extra)
+    except Exception:
+        pass
 
     out = {
         "generated_at": datetime.now().isoformat(),
         # 窗口指纹：同一段数据跑多次，这些字段必然相同
         "data_window": _win,
-        "data_window_id": (f"{_win.get('data_start')}..{_win.get('data_end')}"
-                           f"|{_win.get('n_dates')}d|{_win.get('n_symbols')}s"
-                           if _win else None),
+        "data_window_id": _win_id,
         "n_candidates": total, "n_backtested": len(results),
         "n_fdr_pass": int(sum(r["fdr_pass"] for r in results)),
         "n_survivors": len(survivors),
@@ -626,8 +655,8 @@ if __name__ == "__main__":
                     help="LLM 复合因子（交互因子）提案数量，0=关闭")
     ap.add_argument("--concurrency", type=int, default=16)
     ap.add_argument("--no-sweep", action="store_true")
-    ap.add_argument("--market", default="us", choices=["us", "ashare"],
-                    help="数据市场：us=美股 / ashare=A股")
+    ap.add_argument("--market", default="us", choices=["us", "ashare", "crypto"],
+                    help="数据市场：us=美股 / ashare=A股 / crypto=加密永续主流币")
     ap.add_argument("--index", default="000300",
                     help="A股指数：000300=沪深300 / 000905=中证500 / 000852=中证1000")
     ap.add_argument("--orthogonal", action="store_true",
@@ -643,6 +672,10 @@ if __name__ == "__main__":
                     help="共享提案池 JSON 路径（runs/loop_*/round_*/proposal_pool.json）。"
                          "指定后本进程不再单独调用 LLM，改用池中的全局候选，"
                          "使一个 round 只花一次 LLM 成本。")
+    ap.add_argument("--evolve", type=int, default=0,
+                    help="程序化进化搜索返回的候选数（0=关闭，纯程序化、不调 LLM）")
+    ap.add_argument("--evolve-gens", type=int, default=3,
+                    help="进化搜索代数")
     ap.add_argument("--hold", type=int, default=1,
                     help="持有期（交易日）。默认 1 = 次日收盘换仓。"
                          "FDR/DSR 的 IC 与回测都基于该持有期；"
@@ -679,4 +712,5 @@ if __name__ == "__main__":
                hold=args.hold,
                do_lowfreq=(args.lowfreq or args.lowfreq_strict),
                lowfreq_strict=args.lowfreq_strict,
+               evolve_n=args.evolve, evolve_gens=args.evolve_gens,
                use_cache=not args.no_cache)

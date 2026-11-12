@@ -34,15 +34,31 @@ def _param_grid(op: str) -> list[dict]:
         return [{"n": n} for n in (5, 10, 20, 60)]
     if op.startswith("news_"):
         return [{"n": n} for n in (3, 5, 10, 20)]
+    if op.startswith(("edgar_", "finra_", "wiki_")):
+        return [{"n": n} for n in (20, 60, 120)]
     if op.startswith(("value_", "quality_", "fcf_", "low_")):
         return [{}]
     return [{}]
 
 
-def generate_grid(ops: list[str] | None = None) -> list[dict]:
-    """生成全网格候选（含两个方向）。"""
+EXPERIMENTAL_PREFIXES = ("edgar_", "finra_", "wiki_")
+
+
+def generate_grid(ops: list[str] | None = None,
+                  include_experimental: bool = False) -> list[dict]:
+    """生成全网格候选（含两个方向）。
+
+    实验性数据族（EDGAR 申报事件）默认排除：CPCV 复核显示其在 hold=5
+    真实调仓下 15/15 路径为负、而单次 split 报 +4.6（口径失真）。
+    放进生产 FDR 池只会抬高三重检验门槛、污染其他候选。
+    研究时用 include_experimental=True 显式打开。
+    """
     out = []
-    for op in (ops or list(OPS.keys())):
+    keys = ops if ops is not None else list(OPS.keys())
+    if not include_experimental and ops is None:
+        keys = [k for k in keys
+                if not k.startswith(EXPERIMENTAL_PREFIXES)]
+    for op in keys:
         for params in _param_grid(op):
             for direction in (1, -1):
                 out.append({

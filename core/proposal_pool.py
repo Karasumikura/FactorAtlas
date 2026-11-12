@@ -150,10 +150,31 @@ def build_pool(round_dir: str | os.PathLike, total: int = 300,
     error_holder: list[str] = []
     n_single = int(total * (1 - ratio))
     n_comp = total - n_single
+    try:
+        from llm.client import failure_count as _fc
+        _f_before = _fc()
+    except Exception:  # noqa: BLE001
+        _f_before = None
     singles = _run_single(n_single)
     base["n_single_target"] = n_single
     base["n_single_got"] = len(singles)
     specs += singles
+
+    # 短路（2026-11-07）：单算子整批失败（典型 429 配额耗尽 / 上游挂）时，
+    # 复合阶段必然同样失败 —— 继续打 15 路并发只是把失败请求翻倍。
+    # 按 failure_count 判断「本次区间内是否真的失败过」，避免把旧错误当成新失败。
+    if not singles and n_comp > 0 and _f_before is not None:
+        try:
+            from llm.client import failure_count as _fc2, last_error as _le
+            _f_after = _fc2()
+            _why = _le()
+        except Exception:  # noqa: BLE001
+            _f_after, _why = _f_before, None
+        if _f_after > _f_before:
+            n_comp = 0
+            error = error or _why or "单算子阶段整批失败，跳过复合提案"
+            if verbose:
+                print(f"  [提案池] {error} → 跳过复合提案（不再重复失败请求）", flush=True)
 
     # 自适应降级：2026-10-18 关闭（默认 adaptive=False）。
     #
@@ -178,6 +199,18 @@ def build_pool(round_dir: str | os.PathLike, total: int = 300,
     specs += comps
     if error_holder:
         error = error_holder[0]
+
+    # 提案器内部把单次 LLM 失败吞成 []，所以「整池 0 个」时外层 error 仍是 None。
+    # 这里回捞 llm.client 记录的最近失败原因，把 429 / 网络 / 解析失败写进池文件，
+    # 否则巡检只能看到「池内候选 0 个」，分不清是配额耗尽还是提案全被去重。
+    if not specs and not error:
+        try:
+            from llm.client import last_error
+            error = last_error()
+        except Exception:  # noqa: BLE001
+            error = None
+        if error and verbose:
+            print(f"  [提案池] 全部提案调用失败：{error}", flush=True)
 
     # 池内去重（同一 spec 可能出现多次）
     seen, uniq = set(), []

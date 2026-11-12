@@ -41,6 +41,14 @@ STRONG_SCORE = 8
 #   策略连续 151 轮 silent。按用户决定：只降门槛，不改指标定义（保持原策略语义）。
 NORMAL_SCORE = 5
 
+# 最小止损距离（2026-11-07 实测标定）
+#   本地 4H K 回放 15 标的 / 7305 样本：ATR(14)/close
+#   P25=0.658%  P50=1.126%  P75=1.850%  P90=2.500%
+# 原实现把 stop_price 取成「当根 forming 30m 阳线低点」与 4H swing low 的较大者，
+# 实测 7 个持仓里 5 个止损距入场 <0.1%、2 个恰好 0.000% —— 噪音级，任何回撤都被扫出。
+# 现在强制至少 1 倍 ATR 中位数，避免把噪音当破位。
+MIN_STOP_ATR_PCT = 0.011
+
 
 @dataclass
 class Signal:
@@ -57,15 +65,41 @@ class Signal:
     notes: list[str] = field(default_factory=list)
 
 
+def _closed_4h(df4h: pd.DataFrame) -> pd.DataFrame:
+    """只保留已收盘的 4H K：最后一根若仍在 forming，丢掉。
+
+    判据是时间戳而不是「无条件丢最后一根」—— 回测/单测喂进来的往往全是
+    已收盘 K，无条件丢会改变指标口径，让既有测试失效。
+    """
+    if len(df4h) < 2:
+        return df4h
+    try:
+        end = pd.Timestamp(df4h.index[-1]) + pd.Timedelta(hours=4)
+        if end.tzinfo is None:
+            end = end.tz_localize("UTC")
+        if pd.Timestamp.now(tz="UTC") < end:
+            return df4h.iloc[:-1]
+    except Exception:
+        pass
+    return df4h
+
+
 def evaluate(symbol: str, df4h: pd.DataFrame, df30m: pd.DataFrame,
              use_pullback_confirmation: bool = True) -> Signal:
     """对单个标的做完整共振评估。
 
-    df4h : 4 小时 OHLCV，最后一根为刚收盘的 K（定方向）
+    df4h : 4 小时 OHLCV（落盘的最后一根通常是未收盘的 forming K）
     df30m: 30 分钟 OHLCV，最后一根为当前 K（找入场）
     use_pullback_confirmation: True=稳健（等回踩确认）；False=激进（信号即入）
+
+    2026-11-07 修复：4H 定方向只用**已收盘**K。实测三个标的的最后一根 4H
+    均为 forming，其 close 每 30 分钟就变，导致方向层与出场判定抖动。
+    历史回放 1500 个切片：原版出场触发率 56.2%，其中 55.3% 来自「4H 收盘
+    跌破中轨」；而触发后下一根 4H 收益均值 -0.009%、为负占比仅 48%
+    —— 与抛硬币无异，是纯噪音换手。
     """
-    c4, h4, l4 = df4h["close"], df4h["high"], df4h["low"]
+    d4 = _closed_4h(df4h)
+    c4, h4, l4 = d4["close"], d4["high"], d4["low"]
     c30, h30, l30 = df30m["close"], df30m["high"], df30m["low"]
 
     checks: dict[str, bool] = {}
@@ -130,11 +164,14 @@ def evaluate(symbol: str, df4h: pd.DataFrame, df30m: pd.DataFrame,
     # 优先级：突破阳线低点 > 最近回调低点 > 4H 中轨
     recent_low_4h = float(I.swing_low(l4, lookback=10).iloc[-1])
     breakout_candle_low = None
-    # 找最近一根 30m 突破阳线的低点
+    # 用「已收盘」的上一根 30m K：forming 根的 low 基本等于现价，不能当结构位
     if entry_trigger and len(df30m) >= 2:
-        breakout_candle_low = float(l30.iloc[-1])
-    stop_candidates = [x for x in (breakout_candle_low, recent_low_4h) if x is not None]
-    stop_price = max(stop_candidates) if stop_candidates else None
+        breakout_candle_low = float(l30.iloc[-2])
+    structural = max([x for x in (breakout_candle_low, recent_low_4h)
+                      if x is not None], default=None)
+    ref_px = float(c30.iloc[-1])
+    floor_stop = ref_px * (1 - MIN_STOP_ATR_PCT)
+    stop_price = min(structural, floor_stop) if structural is not None else floor_stop
 
     # ---- 评分（8 项检查表）----
     score = sum(1 for v in checks.values() if v)
@@ -172,7 +209,10 @@ def should_exit(df4h: pd.DataFrame, entry_ref_low: float | None = None) -> tuple
       - 跌破最近回调低点 / 突破阳线低点     → 结构止损
       - MACD 金叉失败并死叉 + MTM 转下      → 指标止损
     """
-    c4, h4, l4 = df4h["close"], df4h["high"], df4h["low"]
+    # 只用已收盘 4H K；forming 根的 close 每 30 分钟都在变，拿它判「收盘跌破」
+    # 等于把一个未完成的数字当成定论（配合 runner 的 4H bar 闸门使用）。
+    x = _closed_4h(df4h)
+    c4, h4, l4 = x["close"], x["high"], x["low"]
     mid4 = I.boll_mid(c4)
     last_close = float(c4.iloc[-1])
     # 结构止损：4H 收盘跌回中轨下方（原文第五节：结构止损优先）

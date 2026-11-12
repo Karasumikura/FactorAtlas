@@ -94,7 +94,18 @@ def decide_targets(book: str, equity: float, universe: list[str],
                       "entry_ts": datetime.now(timezone.utc).isoformat()}
                 state[sym] = st
             # ---- 已持仓：先看止损/止盈 ----
-            ex, reason = should_exit(d4, st.get("entry_low"))
+            # 2026-11-07：出场判定只在「新的 4H K 开始」后做一次。
+            # 原实现每 30 分钟用未收盘 4H K 判一次，形成 8 倍噪音换手：
+            # 历史回放 1500 切片触发率 56.2%，触发后下一根收益均值 -0.009%、
+            # 为负占比 48%（与抛硬币无异），每次却要付两趟手续费。
+            # d4.index[-1] 是 forming 根的起始时间，每 4 小时才变一次。
+            bar = str(d4.index[-1])
+            if st.get("last_exit_bar") != bar:
+                st["last_exit_bar"] = bar
+                ex, reason = should_exit(d4, st.get("entry_low"))
+                st["last_exit_reason"] = reason
+            else:
+                ex, reason = False, "4H未收盘，跳过出场判定"
             if ex:
                 detail.append({"symbol": sym, "action": "exit", "reason": reason,
                                "stage": st.get("stage", 1)})
@@ -184,39 +195,9 @@ def _filter_min_notional(targets_w: dict[str, float], equity: float,
 # ---------------------------------------------------------------------------
 # 执行层：把目标权重表 → 订单 → 成交 → 账本 → 播报
 # ---------------------------------------------------------------------------
-def _book_avg_price(book: str, sym: str, cur: dict[str, float]) -> float | None:
-    """从本盘成交台账推当前持仓的移动平均成本（只在交易所查不到该标的时兜底用）。"""
-    try:
-        from core.book import paths
-        p = paths(book)["ledger"]
-        if not p.exists():
-            return None
-        net = 0.0
-        avg = 0.0
-        for line in p.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                r = json.loads(line)
-            except Exception:  # noqa: BLE001
-                continue
-            if r.get("symbol") != sym or r.get("status") != "sent":
-                continue
-            q = float(r.get("qty") or 0)
-            px = float(r.get("ref_price") or 0)
-            if q <= 0 or px <= 0:
-                continue
-            signed = q if r.get("side") == "BUY" else -q
-            if net == 0 or (net > 0) == (signed > 0):
-                avg = (avg * abs(net) + px * q) / (abs(net) + q)
-            else:                       # 反手：已实现掉旧仓，成本重置为新开仓价
-                if abs(signed) >= abs(net):
-                    avg = px
-            net += signed
-        return avg if abs(net) > 1e-12 else None
-    except Exception:  # noqa: BLE001
-        return None
+# 注：均价兜底逻辑已统一到 core.book._book_avg_price（处理反手更严谨），
+#     此处原先的本地复制版已删除，避免两处口径漂移。
+
 
 
 def tick(book: str, equity: float, live: bool = False, testnet: bool = True,
@@ -265,6 +246,7 @@ def tick(book: str, equity: float, live: bool = False, testnet: bool = True,
 
     if not targets_w:
         rec.update(status="silent", note="本轮无共振信号")
+        _fill_pnl(rec, book, testnet, client=None)
         _heartbeat(rec, book)
         return rec
 
@@ -294,6 +276,7 @@ def tick(book: str, equity: float, live: bool = False, testnet: bool = True,
 
     if not targets_w:
         rec.update(status="silent", note="信号名义额不足最小挂单额")
+        _fill_pnl(rec, book, testnet, client=client, prices=prices)
         _heartbeat(rec, book)
         return rec
 
@@ -302,29 +285,12 @@ def tick(book: str, equity: float, live: bool = False, testnet: bool = True,
     rec["current_positions"] = cur
     rec["book_positions_source"] = "book_ledger"
 
-    # 3b) 本盘浮盈 —— 只算【本盘自有持仓】那一份，不能直接用账户合计（多盘共用账户）。
-    #     币安 /fapi/v2/positionRisk 里 TP/SL 单字段名是 unRealizedProfit（大写 R），
-    #     不是 unrealizedProfit —— 映射错就恒为 0。
-    unrealized = 0.0
-    try:
-        from core.binance_exec import BinanceExec as _BE
-        _ac = _BE.from_env(testnet=testnet)          # 必须带真实 key（signed 接口）
-        upnl = {}
-        for p in _ac.positions():
-            v = p.get("unRealizedProfit", p.get("unrealizedProfit"))
-            upnl[p["symbol"]] = float(v or 0.0)
-        for sym, q in cur.items():
-            if sym in upnl:
-                unrealized += upnl[sym]
-            else:                                   # 交易所查不到该标的 → 用本盘成交均价兜底
-                live_px = prices.get(sym)
-                avg = _book_avg_price(book, sym, cur)
-                if live_px and avg:
-                    unrealized += (live_px - avg) * q
-        rec["pnl_source"] = "book_slice"
-    except Exception as e:  # noqa: BLE001
-        rec["account_error"] = str(e)
-    rec["unrealized_pnl"] = round(unrealized, 4)
+    # 3b) 浮盈要等【成交之后】再算 ── 见第 4b 步 _fill_pnl()。
+    #     历史 bug（2026-10-23 修）：原在此处就算 unrealized，但此时 cur 还是送单前
+    #     的仓位（本步先于 execute_orders）。于是本轮新开的仓完全没被计入，
+    #     推送的浮盈是「加仓前」的数，drawdown_alert 用的也是假数。
+    #     实测：推送 -0.3298，而同标的真值应更接近 -0.25，差的正是 CRCLUSDT 新仓。
+    #     所有出口（silent / no_fill / executed）都要经过 _fill_pnl，不留 None。
 
     targets = [Target(ticker=sym, binance_symbol=sym, weight=w, factor_value=0.0)
                for sym, w in targets_w.items()]
@@ -343,8 +309,14 @@ def tick(book: str, equity: float, live: bool = False, testnet: bool = True,
         rec["filters_error"] = str(e)
     rec["n_filters"] = len(_steps)
 
+    # 再平衡死区（2026-11-05 止血 A）：
+    #   原先 deadband_pct=0.0 / mult=1.0 —— 死区被彻底关掉，目标权重每 tick
+    #   微小抖动都会生成调仓单，产生大量来回 flip（实测 MSTR 35 条记录翻 24 次）。
+    #   改为与低频盘一致的默认口径（build_orders 默认 0.05 / 2.0）：
+    #     门槛 = max(min_notional*2.0, 0.05*equity) = max(10, 5) = 10 USDT
+    #   只拦「已有持仓的微调」；开仓与全平仓始终放行（止损不会被憋住）。
     orders = build_orders(targets, equity, prices, cur, min_notional=5.0,
-                          deadband_pct=0.0, deadband_minnotional_mult=1.0,
+                          deadband_pct=0.05, deadband_minnotional_mult=2.0,
                           steps=_steps, min_qtys=_minq)
     # 平仓单优先（build_orders 已排序）
     rec["orders"] = [o.__dict__ for o in orders]
@@ -352,12 +324,19 @@ def tick(book: str, equity: float, live: bool = False, testnet: bool = True,
 
     if not orders:
         rec.update(status="silent", note="目标与持仓一致，无需调仓")
+        _fill_pnl(rec, book, testnet, client=client, prices=prices)
         _heartbeat(rec, book)
         return rec
 
     # 4) 执行
+    #    双向持仓模式下本盘固定占一个方向腿，避免与别的盘互相平仓（见 book.book_position_side）
+    #    台账记录真实生效值：单向账户返回 BOTH，不再写假的 SHORT（2026-11-05 修复）
+    from core.book import book_position_side
+    _pside = book_position_side(book, client=client)
+    rec["position_side"] = _pside
     results = execute_orders(orders, testnet=testnet, leverage=leverage,
-                             max_notional=max_notional, dry=not live)
+                             max_notional=max_notional, dry=not live,
+                             position_side=_pside, book=book)
     rec["results"] = results
     sent = [r for r in results if r.get("status") == "sent"]
     rec["executed"] = bool(sent)
@@ -380,8 +359,46 @@ def tick(book: str, equity: float, live: bool = False, testnet: bool = True,
             save_state(book, pending_state)
             rec["state_committed"] = True
 
+    # 4b) 浮盈 —— 必须在【成交落账之后】算，用成交后的本盘台账。
+    #     成交前台账里还是加仓前的仓位，此时算出来的数会让本轮新仓凭空消失。
+    _fill_pnl(rec, book, testnet, client=client, prices=prices,
+              positions=rec.get("book_positions_after"))
+
     _heartbeat(rec, book)
     return rec
+
+
+def _fill_pnl(rec: dict, book: str, testnet: bool,
+              client=None, prices: dict[str, float] | None = None,
+              positions: dict[str, float] | None = None) -> None:
+    """把本盘浮盈写进 rec["unrealized_pnl"] / rec["pnl_source"]。
+
+    统一口径：只算【本盘台账】里的持仓（单账户跑多盘，绝不能取账户合计）。
+    成交路径要传 positions=成交后的台账；silent 路径传 None 即读当前台账。
+    """
+    try:
+        from core.book import book_unrealized, load_book_positions
+        cur = positions if positions is not None else load_book_positions(book)
+        px = dict(prices or {})
+        # 台账里有、但本批没拉到价的标的 → 补拉（成交后价格也刷新一次）
+        if client is not None:
+            for sym in cur:
+                if sym in px:
+                    continue
+                try:
+                    tk = client.ticker(sym)
+                    lp = tk.get("lastPrice")
+                    if lp is not None:
+                        px[sym] = float(lp)
+                except Exception:  # noqa: BLE001
+                    pass
+        upnl, src = book_unrealized(book, cur, px, testnet=testnet)
+        rec["pnl_source"] = src
+        rec["pnl_positions"] = cur
+        rec["unrealized_pnl"] = round(upnl, 6)
+    except Exception as e:  # noqa: BLE001
+        rec["account_error"] = str(e)
+        rec["unrealized_pnl"] = None
 
 
 def _heartbeat(rec: dict, book: str) -> None:

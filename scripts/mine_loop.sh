@@ -15,6 +15,7 @@
 set -uo pipefail
 
 cd /opt/quant-lab
+PROJ=/opt/quant-lab          # 2026-11-08 修：本轮同步丢了这个定义，set -u 下 $PROJ 直接崩
 PY=/opt/quant-lab/venv/bin/python
 TS=$(date +%Y%m%d_%H%M%S)
 OUT="runs/loop_${TS}"
@@ -37,6 +38,38 @@ COOLDOWN_SEC="${MINE_COOLDOWN_SEC:-14400}"   # 每轮之间冷却（默认 4 小
 HOLDS_STR="${MINE_HOLDS:-1 5 20}"
 read -r -a HOLD_LIST <<< "$HOLDS_STR"
 N_HOLDS=${#HOLD_LIST[@]}
+
+# ── 跨市场轮换（2026-10-24 新增）──────────────────────────────
+# 每股轮到哪个市场挖。加密永续 17 只主流币、2200 天，单轮约 2 分钟（美股约 10 分钟），
+# 所以按轮次交替：奇数额美股，偶数额 crypto。
+# 优势：crypto 复用同一个提案池（实测 120 个候选里 110 个能直接在币面板跑），
+# 不额外打 LLM 请求，纯赚一个市场的搜索。
+#
+# 为什么币的聚类簇不一样：币 24/7 无财报断点，长周期动量(120/250)钝化，
+# 主导簇是短中期动量(20/60)+波动率。见 core/orthogonal.py 的 CRYPTO_CLUSTER。
+#
+# 可用 MINE_MARKETS 覆盖，例如 MINE_MARKETS="us" 即关掉币（回到纯美股）。
+# 注意：ashare 因回测太慢已停用，见下方 ENABLE_ASHARE。
+MARKETS_STR="${MINE_MARKETS:-us crypto}"
+read -r -a MARKET_LIST <<< "$MARKETS_STR"
+N_MARKETS=${#MARKET_LIST[@]}
+
+# ── 市场轮换指针（2026-10-25 修复）────────────────────────────────
+# 事故：原来 MKT 取自 (ROUND-1) % N_MARKETS，而 ROUND 是进程内从 0 数的。
+# quant-miner 因冷却/Restart 频繁重启，ROUND 每次都回到 1 —— 于是 (1-1)%2=0
+# 永远选中 MARKET_LIST[0]，即 us。结果 mine_loop.log 里 crypto 一次都没跑过，
+# 跨市场交替形同虚设（crypto 只存在于 mine_rotation.sh 的手动日志里）。
+# 修法：指针落盘到 state/mine_market_ptr.json，与进程重启无关。每轮开始取当前
+# 市场，本轮结束后推进一位；服务中途挂掉也不丢进度（宁可重复一次，不会饿死一个市场）。
+MARKET_STATE="state/mine_market_ptr.json"
+mkdir -p state
+if [ -f "$MARKET_STATE" ]; then
+    MARKET_PTR=$("$PY" -c "import json;print(int(json.load(open('$MARKET_STATE')).get('next_index',0)))" 2>/dev/null || echo 0)
+else
+    # 首次：沿用 mine_rotation.json 的指针，避免和旧调度器的历史进度打架
+    MARKET_PTR=$("$PY" -c "import json;print(int(json.load(open('state/mine_rotation.json')).get('next_index',0)))" 2>/dev/null || echo 0)
+fi
+case "$MARKET_PTR" in ''|*[!0-9]*) MARKET_PTR=0 ;; esac
 
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$OUT/driver.log"; }
 
@@ -71,7 +104,7 @@ wait_mem() {
 wait_external() {
     local waited=0
     while [ "$waited" -lt 1800 ]; do
-        if ! pgrep -f "core\.mine|core\.hold_sweep|pull_ashare.py|core\.promote" >/dev/null 2>&1; then
+        if ! pgrep -f "[c]ore\.mine|[c]ore\.hold_sweep|pull_ashare.py|[c]ore\.promote" >/dev/null 2>&1; then
             return 0
         fi
         sleep 30; waited=$((waited + 30))
@@ -83,6 +116,19 @@ wait_external
 
 ROUND=0
 while true; do
+    # ── 代码热更新闸门（2026-11-05 跨机部署新增）────────────────────
+    # 主控机的 core.self_repair 修的是主控机上的文件，同步脚本把代码推过来后，
+    # 必须重启进程才生效。但绝不能在外部硬 restart：那会把 4 小时冷却打断成
+    # "同步周期"那么短（2 小时），试验数 N 凭空加速增长、DSR 门槛越抬越高，
+    # 等于用运维动作偷偷加重过拟合惩罚。改成：同步脚本只 touch 一个标记文件，
+    # 本循环在下一轮开始前自己干净退出（unit 是 Restart=always，立刻被拉起，
+    # 冷却时间照旧走完）。
+    if [ -f state/reload_pending ]; then
+        rm -f state/reload_pending
+        log "检测到 state/reload_pending（主控机同步了新代码），本轮不挖，退出让 systemd 重启加载"
+        exit 0
+    fi
+
     ROUND=$((ROUND + 1))
     if [ "$ROUNDS_LIMIT" -gt 0 ] && [ "$ROUND" -gt "$ROUNDS_LIMIT" ]; then
         log "已达轮次上限 ${ROUNDS_LIMIT}，退出"
@@ -92,116 +138,190 @@ while true; do
     mkdir -p "$OUT/$R"
     # 本轮持有期：按轮次轮换（1 -> 5 -> 20 -> 1 ...）
     HOLD="${HOLD_LIST[$(( (ROUND - 1) % N_HOLDS ))]}"
-    log "----- 第 ${ROUND} 轮开始（hold=${HOLD}）-----"
+    # 本轮市场：从持久化指针取（us -> crypto -> us ...），与进程重启无关
+    # ── 多臂老虎机选市场（借鉴 RD-Agent(Q) 的方向调度）──
+    # 只选 market，不选 hold：hold 必须跟提案池一致（HOLD="$POOL_HOLD"）。
+    # 状态读不到/输出非法就回退固定轮换，绝不因调度器故障停挖。
+    if [ "${MINE_BANDIT:-0}" = "1" ]; then
+        BANDIT_MKT=$("$PY" -m core.mine_bandit --markets $MARKETS_STR \
+            --state "$PROJ/state/mine_bandit.json" 2>/dev/null || echo "")
+        case " $MARKETS_STR " in
+            *" $BANDIT_MKT "*) MKT="$BANDIT_MKT" ;;
+            *) MKT="${MARKET_LIST[$(( MARKET_PTR % N_MARKETS ))]}" ;;
+        esac
+        log "轮${ROUND} 多臂老虎机选向：${MKT}"
+    else
+        MKT="${MARKET_LIST[$(( MARKET_PTR % N_MARKETS ))]}"
+    fi
+    log "----- 第 ${ROUND} 轮开始（market=${MKT} hold=${HOLD}）-----"
+
+    # crypto 单轮很快（~2 分钟），美股慢（~10 分钟）。crypto 轮不需要拉新闻、
+    # 也不需要长持有期 —— 币没有财报断点，hold=1/5/20 的语义差异远小于美股。
+    IS_CRYPTO=0
+    [ "$MKT" = "crypto" ] && IS_CRYPTO=1
+    # 正交搜索的复合提案量：币面板小（17 只标的），60 个复合候选足够；
+    # 美股 655 只，正交搜索本身就是筛子，给 40 个即可（太多会被正交全部筛掉）。
+    # 2026-11-08：本机零 LLM，提案全部来自主控机；COMPOSITE* 已无消费方
 
     # 1) 全局提案池：一个 round 只调用一次 LLM（幂等，已存在则复用）
     #    以前 5 个标的各自调用一次 LLM，成本 5 倍且互相看不见对方的提案。
     #    现在先建一个共享池，5 个标的从同一池取用：成本 1 倍 + 天然全局去重。
     #
-    # ── 新闻采集（2026-10-22 从 quant-lab-nightly 并入）──────────────
-    # 背景：nightly 与 miner 调的是同一个 core.mine，功能重复；唯一 nightly
-    # 独有的是「拉新闻」（US 新闻因子需要）。合并后 nightly 整个停用，新闻改
-    # 由 miner 负责。但 Marketaux 只有 100 次/天额度，nightly 一次要吃掉 90，
-    # 而 miner 一天跑约 6 轮 —— 每轮都拉会 540 次打爆额度，后 5 轮全空转。
-    # 所以这里按「当天是否已拉过」做闸门：一天只拉一次，幂等。
-    NEWS_STAMP="data/news/.last_pull_date"
-    TODAY_UTC=$("$PY" -c "import datetime;print(datetime.datetime.now(datetime.timezone.utc).date().isoformat())")
-    LAST_PULL=$(cat "$NEWS_STAMP" 2>/dev/null || echo "")
-    if [ "$LAST_PULL" != "$TODAY_UTC" ]; then
-        LEFT=$("$PY" -c "
-import sys; sys.path.insert(0,'/opt/quant-lab')
-from data.news import usage_left
-print(usage_left())" 2>/dev/null || echo 0)
-        if [ "${LEFT:-0}" -ge 10 ]; then
-            log "轮${ROUND} 拉取新闻（今日剩余额度 ${LEFT}）"
-            # 注意：超时也写 stamp。90 只票约 4.5 分钟，但网络慢时会拖到 10 分钟+；
-            # 若超时后不写 stamp，下一轮会重拉一遍、把额度白白再吃一次。
-            # 新闻因子对「今天漏了几只票」不敏感，宁可少拉也不要重复烧额度。
-            if timeout 1800 "$PY" scripts/pull_news.py 90 >> "runs/news_${TS}.log" 2>&1; then
-                echo "$TODAY_UTC" > "$NEWS_STAMP"
-            else
-                rc=$?
-                echo "$TODAY_UTC" > "$NEWS_STAMP"
-                log "轮${ROUND} 新闻采集未完整结束（rc=${rc}），已记 stamp 防重复烧额度"
-            fi
-        else
-            log "轮${ROUND} 跳过新闻采集（今日额度仅剩 ${LEFT}）"
+    # ── 本机不做任何 LLM 推理（店长定死）────────────────────────────────
+    # 深圳机的角色只有：回测 / DSR / 晋升。提案由主控机（香港机）生成后随
+    # sync_panel_to_sz.sh 推到 state/pool/；新闻链路也在主控机跑（Marketaux
+    # 密钥不出主控机，见 scripts/news_daily.sh）。
+    # 以前这里还有「本机自己提一遍」「新闻 LLM 判断」两段 —— 那就是 429 和
+    # credits 的来源，已删除。真需要提案就走主控机，别在本机回退。
+    export QUANT_LLM_DISABLED=1
+
+    # 共享提案池：只读，不生成。持有期跟着池文件走（主控机按 1→5→20 轮换），
+    # 保证「提案时的 hold 提示」与「回测窗口」永远一致。
+    POOL="$PROJ/state/pool/proposal_pool.json"
+    POOL_N=0; POOL_HOLD=""; POOL_AGE_H=999
+    if [ -f "$POOL" ]; then
+        POOL_N=$("$PY" -c "import json;print(int(json.load(open('$POOL')).get('n_specs',0)))" 2>/dev/null || echo 0)
+        POOL_HOLD=$("$PY" -c "import json;print(int(json.load(open('$POOL')).get('hold',1)))" 2>/dev/null || echo 1)
+        POOL_AGE_H=$("$PY" -c "
+import json,time,datetime
+d=json.load(open('$POOL'))
+print(int((time.time()-datetime.datetime.fromisoformat(d['generated_at']).timestamp())//3600))" 2>/dev/null || echo 999)
+    fi
+    case "$POOL_N" in ''|*[!0-9]*) POOL_N=0 ;; esac
+    case "$POOL_AGE_H" in ''|*[!0-9]*) POOL_AGE_H=999 ;; esac
+    POOL_ARG=()
+    if [ "$POOL_N" -gt 0 ] && [ "$POOL_AGE_H" -le 12 ]; then
+        HOLD="$POOL_HOLD"
+        POOL_ARG=(--proposal-pool "$POOL")
+        log "轮${ROUND} 提案池 ${POOL_N} 个（hold=${HOLD}，${POOL_AGE_H}h 前主控机生成）"
+    else
+        log "轮${ROUND} 提案池缺失/过期（n=${POOL_N} age=${POOL_AGE_H}h）→ 本轮只用本地模板，零 LLM"
+    fi
+
+    # ── 每轮回测 2 并行（2026-11-09）──────────────────────────────
+    # 同机实测：单进程 79.3 候选/分钟、2 进程 163.1/分钟（加速 2.11×），
+    # 单进程峰值 RSS 371MB，2 个 = 742MB < cgroup MemoryHigh=1000M。
+    # promote 峰值曾到 1.59G，必须等全部 mine 结束再单独串行跑。
+    # MINE_PARALLEL=1 可一键退回全串行。
+    PAR="${MINE_PARALLEL:-2}"
+    EVOLVE_N="${EVOLVE_N:-24}"   # 程序化进化搜索候选数（仅美股轮，纯程序化、不调 LLM）
+    MINE_PIDS=()
+    launch_mine() {
+        local tag="$1" tmo="$2" logf="$3"; shift 3
+        log "轮${ROUND} ${tag}"
+        timeout "$tmo" "$PY" -m core.mine "$@" > "$logf" 2>&1 &
+        MINE_PIDS+=("$!")
+        # wait -n：等【任意一个】结束就腾槽位。wait 第一个会死等最慢的
+        # us(12min)，crypto(2min) 早结束也补不上第三个任务，空一核十分钟。
+        if [ "${#MINE_PIDS[@]}" -ge "$PAR" ]; then
+            wait -n "${MINE_PIDS[@]}" 2>/dev/null
+            RC=$?
+            [ "$RC" -ne 0 ] && log "轮${ROUND} 某回测任务结束 rc=${RC}（继续）"
+            ALIVE=()
+            for pid in "${MINE_PIDS[@]}"; do
+                kill -0 "$pid" 2>/dev/null && ALIVE+=("$pid")
+            done
+            MINE_PIDS=("${ALIVE[@]}")
+            unset ALIVE
         fi
+    }
+    wait_mem "${MINE_PAR_MEM_KB:-800000}"
+
+    if [ "$IS_CRYPTO" -eq 0 ]; then
+        launch_mine "[美股] mining" 5400 "$OUT/$R/mine_us.log" \
+            --llm-total 0 --llm-composite 0 --concurrency 2 \
+            --evolve "${EVOLVE_N:-0}" --evolve-gens 3 \
+            --market us --hold "$HOLD" "${POOL_ARG[@]}" --out "$OUT/$R/mine_us.json"
     fi
 
-    # ── 新闻清洗 + LLM 判断（2026-10-23 新增）────────────────────
-    # 采集完不等于能用：原始新闻里有 13%+ 的大盘综述被挂到多只票名下、
-    # 还有 GF 估值模板文和 ETF 资金流快照。清洗把「个股」和「宏观」分成
-    # 两股（店长指出大盘也要算，所以宏观不是噪声、是独立通道），然后让
-    # LLM 逐票给方向+强度，绝不碰价位。
-    # 只判断**当前持仓**：没有仓位的票新闻再好也不该影响动作（选股归因子层）。
-    # 失败不阻断挖掘——新闻层是加分项，不能因为它挂掉就停了主流程。
-    if [ "${ENABLE_NEWS_VERDICT:-1}" = "1" ]; then
-        log "轮${ROUND} 新闻清洗 + LLM 判断"
-        timeout 300 "$PY" -m scripts.clean_news --save >> "runs/news_${TS}.log" 2>&1 \
-            || log "轮${ROUND} 新闻清洗异常（继续）"
-        timeout 900 "$PY" -m scripts.llm_news --macro --positions >> "runs/news_${TS}.log" 2>&1 \
-            && log "轮${ROUND} 新闻判断完成" \
-            || log "轮${ROUND} 新闻判断异常（继续）"
+    # 加密永续：复用同一提案池、不额外打 LLM。面板停更就跳过，别空转。
+    CRYPTO_END=$("$PY" -c "import json;print(json.load(open('data/crypto/meta.json')).get('end',''))" 2>/dev/null || echo "")
+    CRYPTO_STALE=$("$PY" - "$CRYPTO_END" <<'PYEOF'
+import sys, datetime
+end = sys.argv[1] if len(sys.argv) > 1 else ""
+try:
+    d = datetime.date.fromisoformat(end)
+    print((datetime.datetime.now(datetime.timezone.utc).date() - d).days)
+except Exception:
+    print(99)
+PYEOF
+)
+    if [ "${CRYPTO_STALE:-99}" -gt 2 ]; then
+        log "轮${ROUND} [加密] 跳过：面板末日 ${CRYPTO_END}（滞后 ${CRYPTO_STALE} 天），先修数据再挖"
+    else
+        launch_mine "[加密] mining" 1800 "$OUT/$R/mine_crypto.log" \
+            --llm-total 0 --llm-composite 0 --concurrency 2 \
+            --market crypto --hold "$HOLD" "${POOL_ARG[@]}" --out "$OUT/$R/mine_crypto.json"
     fi
 
-    if [ "$HOLD" = "1" ]; then POOL="$OUT/$R/proposal_pool.json"
-    else POOL="$OUT/$R/proposal_pool_h${HOLD}.json"; fi
-    wait_mem 550000
-    log "轮${ROUND} 生成共享提案池（单次 LLM）"
-    # 池子规模：600 → 300。
-    # 600 是按「A股×3 + 美股 + 正交」共 5 个标的设定的；A股停用后实际只有
-    # 2 个消费方（美股 + 正交），按 5 个标的分摊会有一半候选没人消费。
-    # 注意：下面 mine 命令里的 --llm-total 在有 --proposal-pool 时无效，
-    # 真正决定 LLM 提案量的是这里的 POOL_TOTAL。
-    POOL_TOTAL="${POOL_TOTAL:-150}"
-    timeout 1800 "$PY" -c "
-import sys
-sys.path.insert(0, '/opt/quant-lab')
-from core.proposal_pool import build_pool
-specs = build_pool('$OUT/$R', total=$POOL_TOTAL, concurrency=2, hold=$HOLD)
-print(f'池内候选 {len(specs)} 个')
-" > "$OUT/$R/proposal_pool.log" 2>&1 || log "轮${ROUND} 提案池异常（各进程将回退到自身提案）"
-grep -E "池内候选|复用已有池|回退" "$OUT/$R/proposal_pool.log" 2>/dev/null | sed 's/^/  /' | tee -a "$OUT/driver.log"
-
-    # 2) 美股挖掘
-    wait_mem 550000
-    log "轮${ROUND} [美股] mining"
-    timeout 5400 "$PY" -m core.mine --llm-total 150 --concurrency 2 \
-        --market us --hold "$HOLD" --proposal-pool "$POOL" --out "$OUT/$R/mine_us.json" \
-        > "$OUT/$R/mine_us.log" 2>&1 || log "轮${ROUND} [美股] mining 异常（继续）"
-
-    # 3) A股三指数（降频严格：只留真实调仓可交易）
-    #    已停用：642 个候选在 0.1 个/秒的回测速度下需要约 6400s，
-    #    而 timeout 只有 3600s，三个标的全部跑不完就被强杀，
-    #    等于每轮白烧 1 小时 + 400MB 内存且零产出。等候选规模或回测提速再开。
+    # A股三指数：仍停用（642 候选在 0.1 个/秒下跑不完），ENABLE_ASHARE=1 才开
     if [ "${ENABLE_ASHARE:-0}" = "1" ]; then
-    for IDX in 000300 000905 000852; do
-        wait_mem 550000
-        log "轮${ROUND} [A股 ${IDX}] mining"
-        timeout 3600 "$PY" -m core.mine --llm-total 100 --concurrency 2 \
-            --market ashare --index "$IDX" --hold "$HOLD" --lowfreq-strict \
-            --proposal-pool "$POOL" --out "$OUT/$R/mine_ashare_${IDX}.json" \
-            > "$OUT/$R/mine_ashare_${IDX}.log" 2>&1 || log "轮${ROUND} [A股 ${IDX}] 异常（继续）"
-    done
+        for IDX in 000300 000905 000852; do
+            launch_mine "[A股 ${IDX}] mining" 3600 "$OUT/$R/mine_ashare_${IDX}.log" \
+                --llm-total 0 --llm-composite 0 --concurrency 2 \
+                --market ashare --index "$IDX" --hold "$HOLD" --lowfreq-strict \
+                "${POOL_ARG[@]}" --out "$OUT/$R/mine_ashare_${IDX}.json"
+        done
     fi
 
-    # 4) 正交搜索：找与主导簇低相关的新因子（组合时才有分散收益）
-    wait_mem 550000
-    log "轮${ROUND} [美股] 正交搜索"
-    timeout 3600 "$PY" -m core.mine --llm-total 125 --concurrency 2 \
-        --market us --orthogonal --hold "$HOLD" --proposal-pool "$POOL" \
-        --out "$OUT/$R/ortho_us.json" \
-        > "$OUT/$R/ortho_us.log" 2>&1 || log "轮${ROUND} [美股] 正交异常（继续）"
+    # 正交搜索：找与主导簇低相关的新因子
+    launch_mine "[${MKT}] 正交搜索" 3600 "$OUT/$R/ortho_${MKT}.log" \
+        --llm-total 0 --llm-composite 0 --concurrency 2 \
+        --market "$MKT" --orthogonal --hold "$HOLD" "${POOL_ARG[@]}" \
+        --out "$OUT/$R/ortho_${MKT}.json"
+
+    # 等剩余任务；promote 必须在全部 mine 结束后单独跑（内存峰值 1.59G）
+    for pid in "${MINE_PIDS[@]}"; do
+        wait "$pid" || log "轮${ROUND} 回测任务 rc=$?（继续）"
+    done
+    log "轮${ROUND} 回测任务全部结束（并行度=${PAR}）"
 
     # 5) 晋升闸门：跨会话可重复 + DSR/PBO，只有过关的进正式库
+    #    2026-10-24：耗时实测 9 分 11 秒（扫描 250+ 个 mine 结果文件）。
+    #    原 timeout 1200s 紧贴实测值，机器一有负载就超时、promote.log 全空。
+    #    放宽到 2400s。crypto 结果文件也在扫描范围内，后续会继续变多。
     log "轮${ROUND} 因子晋升闸门"
-    timeout 1200 "$PY" -m core.promote \
-        --glob 'runs/mine*.json' \
+    # 2026-10-25：去掉 --glob 'runs/mine*.json'。那个通配符扫的是 runs/ 根目录下
+    # 37 个历史日跑结果（最早 10-15），每轮把同样的几百个老候选再算一次 DSR/PBO，
+    # 正是 promote 吃 1.2G 内存被 OOM 杀掉的主因。loop 输出已在库里晋升过，
+    # 老文件不会带来新因子 —— 只扫 loop_*/round_*/ 即可。
+    timeout 2400 "$PY" -m core.promote \
         --glob 'runs/loop_*/round_*/mine*.json' \
         --glob 'runs/loop_*/round_*/ortho*.json' \
         > "$OUT/$R/promote.log" 2>&1 || log "轮${ROUND} 晋升闸门异常（继续）"
-    grep -E "本次晋升|正式库共" "$OUT/$R/promote.log" 2>/dev/null | sed 's/^/  /' | tee -a "$OUT/driver.log"
+    grep -E "本次新晋|本次晋升|正式库共" "$OUT/$R/promote.log" 2>/dev/null | sed 's/^/  /' | tee -a "$OUT/driver.log"
+
+    # 回灌老虎机（奖励 = 本轮 survivor 数，不用速率：crypto 轮天生快 5 倍，
+    # 用速率会饿死美股）
+    if [ "${MINE_BANDIT:-0}" = "1" ] && [ -f "$OUT/$R/mine_${MKT}.json" ]; then
+        REWARD=$("$PY" - "$OUT/$R/mine_${MKT}.json" <<'PYEOF'
+import json, sys
+try:
+    print(int(json.load(open(sys.argv[1])).get("n_survivors", 0)))
+except Exception:
+    print(0)
+PYEOF
+)
+        "$PY" -m core.mine_bandit --markets $MARKETS_STR \
+            --state "$PROJ/state/mine_bandit.json" \
+            --record "$MKT" --reward "${REWARD:-0}" 2>/dev/null || true
+    fi
+
+    # 推进市场指针（落盘，跨进程重启有效）
+    MARKET_PTR=$(( MARKET_PTR + 1 ))
+    "$PY" - "$MARKET_STATE" "$MARKET_PTR" "$MKT" <<'PYEOF' 2>/dev/null || true
+import json, sys, datetime
+path, nxt, mkt = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+try:
+    d = json.load(open(path))
+except Exception:
+    d = {}
+d["next_index"] = nxt
+d["last_market"] = mkt
+d["last_run_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+json.dump(d, open(path, "w"), ensure_ascii=False, indent=1)
+PYEOF
+    log "轮${ROUND} 完成，市场指针 -> ${MARKET_PTR}（下一轮 ${MARKET_LIST[$(( MARKET_PTR % N_MARKETS ))]}）"
 
     log "----- 第 ${ROUND} 轮完成；冷却 ${COOLDOWN_SEC}s -----"
     sleep "$COOLDOWN_SEC"

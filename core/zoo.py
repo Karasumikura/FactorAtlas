@@ -11,6 +11,11 @@ from core import config
 
 ZOO_FILE = config.DATA_DIR / "factor_zoo.json"
 
+# 回测口径版本。2026-11-01 分层/掩码修正（crypto 17 只宇宙可分层、币价下限 0.01）
+# 之前写入的结果全部不可复用 —— 它们是在「永远 NaN」的旧口径下算出来的。
+# 老条目留在文件里不删（可追溯），只是不再命中缓存；同 key 重算后会被覆盖。
+ZOO_ALGO = 2
+
 
 def _key(spec: dict, hold: int | None = None) -> str:
     """缓存键。hold=1（默认持有期）时**不加后缀**，保持与历史 6.5 万条记录兼容，
@@ -52,13 +57,22 @@ def has(zoo: dict, spec: dict, hold: int | None = None) -> bool:
     return _key(spec, hold) in zoo["factors"]
 
 
+def reusable(entry: dict, panel_end: str | None, hold: int | None) -> bool:
+    """同数据窗口 + 同持有期 + 同回测口径，三者都一致才允许复用缓存。"""
+    if not entry or not isinstance(entry.get("result"), dict):
+        return False
+    return (entry.get("panel_end") == panel_end
+            and entry.get("hold") == hold
+            and entry.get("algo") == ZOO_ALGO)
+
+
 def record(zoo: dict, spec: dict, result: dict, panel_end: str | None = None,
            hold: int | None = None):
     zoo["factors"][_key(spec, hold)] = {
         "name": spec.get("name"), "spec": spec,
         "result": result, "recorded_at": datetime.now().isoformat(),
         # 数据窗口指纹：panel_end 变化即视为样本更新，缓存不再复用
-        "panel_end": panel_end, "hold": hold,
+        "panel_end": panel_end, "hold": hold, "algo": ZOO_ALGO,
     }
 
 
